@@ -18,6 +18,7 @@ func main() {
 	batchSize := flag.Int("batch", 10000, "batch size for reading")
 	checkpointPath := flag.String("checkpoint", "geostreamer.checkpoint", "path to checkpoint file")
 	strictMode := flag.Bool("strict", false, "strict mode - stop on any error")
+	debugMode := flag.Bool("debug", false, "debug mode - show detailed info about problematic lines")
 	flag.Parse()
 
 	// Создаем контекст с отменой для graceful shutdown
@@ -27,7 +28,7 @@ func main() {
 
 	// Создаем CSV reader
 	delimRune := []rune(*delimiter)[0]
-	source, err := readers.NewCSVReader(*csvPath, delimRune, *batchSize, *checkpointPath, *strictMode)
+	source, err := readers.NewCSVReader(*csvPath, delimRune, *batchSize, *checkpointPath, *strictMode, *debugMode)
 	if err != nil {
 		log.Fatalf("Failed to create CSV reader: %v", err)
 	}
