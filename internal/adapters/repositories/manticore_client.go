@@ -3,6 +3,7 @@ package repositories
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -205,6 +206,7 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 			}
 		}
 
+		// Используем rawResponse=false для получения структурированного ответа
 		resp, _, err = c.apiClient.UtilsAPI.Sql(ctx).
 			Body(query).
 			RawResponse(false). // Получаем структурированный ответ
@@ -212,6 +214,11 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 
 		if err == nil {
 			break
+		}
+
+		// Логируем ошибку для отладки
+		if c.config.DebugMode {
+			log.Printf("Query attempt %d failed: %v", attempt+1, err)
 		}
 	}
 
@@ -237,22 +244,68 @@ func (c *ManticoreClient) parseResponse(resp *Manticoresearch.SqlResponse) ([]do
 		return nil, nil
 	}
 
-	// В SqlResponse.Hits может быть массив объектов
-	hits, ok := resp.Hits.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response format: hits is not an object")
-	}
+	// Получаем актуальный экземпляр из oneOf обертки
+	actualInstance := resp.GetActualInstance()
 
-	hitsArray, ok := hits["hits"].([]interface{})
-	if !ok {
-		// Может быть пустой ответ
+	switch v := actualInstance.(type) {
+	case *Manticoresearch.SqlObjResponse:
+		// Это объектный формат ответа (когда rawResponse=false)
+		return c.parseSqlObjResponse(v)
+	case *[]map[string]interface{}:
+		// Это массивный формат ответа (когда rawResponse=true)
+		return c.parseRawResponse(v)
+	default:
+		return nil, fmt.Errorf("unexpected response type: %T", actualInstance)
+	}
+}
+
+// parseSqlObjResponse парсит ответ в формате SqlObjResponse
+func (c *ManticoreClient) parseSqlObjResponse(resp *Manticoresearch.SqlObjResponse) ([]domain.GeoHit, error) {
+	if resp == nil {
 		return nil, nil
 	}
 
+	// Извлекаем hits из ответа
+	hits, ok := resp.GetHitsOk()
+	if !ok {
+		return nil, nil
+	}
+
+	// В hits должен быть массив "hits"
+	hitsArray, ok := hits["hits"].([]interface{})
+	if !ok {
+		return nil, nil
+	}
+
+	return c.extractHitsFromArray(hitsArray)
+}
+
+// parseRawResponse парсит сырой ответ (массив записей)
+func (c *ManticoreClient) parseRawResponse(resp *[]map[string]interface{}) ([]domain.GeoHit, error) {
+	if resp == nil || len(*resp) == 0 {
+		return nil, nil
+	}
+
+	result := make([]domain.GeoHit, 0, len(*resp))
+
+	for _, row := range *resp {
+		// В сыром ответе каждая строка - это прямая запись
+		hit, err := c.rowToGeoHit(row)
+		if err != nil {
+			continue // пропускаем некорректные строки
+		}
+		result = append(result, hit)
+	}
+
+	return result, nil
+}
+
+// extractHitsFromArray извлекает хиты из массива hits
+func (c *ManticoreClient) extractHitsFromArray(hitsArray []interface{}) ([]domain.GeoHit, error) {
 	result := make([]domain.GeoHit, 0, len(hitsArray))
 
-	for _, hit := range hitsArray {
-		hitMap, ok := hit.(map[string]interface{})
+	for _, hitItem := range hitsArray {
+		hitMap, ok := hitItem.(map[string]interface{})
 		if !ok {
 			continue
 		}
@@ -263,69 +316,127 @@ func (c *ManticoreClient) parseResponse(resp *Manticoresearch.SqlResponse) ([]do
 			continue
 		}
 
-		var geoHit domain.GeoHit
-
-		// ID
-		if id, ok := source["id"]; ok {
-			switch v := id.(type) {
-			case float64:
-				geoHit.ID = uint64(v)
-			case uint64:
-				geoHit.ID = v
-			case int64:
-				geoHit.ID = uint64(v)
-			}
+		hit, err := c.sourceToGeoHit(source)
+		if err != nil {
+			continue
 		}
-
-		// Name
-		if name, ok := source["name"].(string); ok {
-			geoHit.Name = name
-		}
-
-		// GeohashesString
-		if geohashes, ok := source["geohashes_string"].(string); ok {
-			geoHit.GeohashesString = geohashes
-		}
-
-		// GeohashesUint64 - может быть массивом или строкой
-		if geohashesUint, ok := source["geohashes_uint64"]; ok {
-			switch v := geohashesUint.(type) {
-			case []interface{}:
-				geoHit.GeohashesUint64 = make([]uint64, len(v))
-				for i, val := range v {
-					if f, ok := val.(float64); ok {
-						geoHit.GeohashesUint64[i] = uint64(f)
-					}
-				}
-			}
-		}
-
-		// Occurrences
-		if occ, ok := source["occurrences"]; ok {
-			switch v := occ.(type) {
-			case float64:
-				geoHit.Occurrences = int(v)
-			case int:
-				geoHit.Occurrences = v
-			}
-		}
-
-		// FirstGeonameID
-		if firstID, ok := source["first_geoname_id"]; ok {
-			switch v := firstID.(type) {
-			case float64:
-				geoHit.FirstGeonameID = uint64(v)
-			case uint64:
-				geoHit.FirstGeonameID = v
-			case int64:
-				geoHit.FirstGeonameID = uint64(v)
-			}
-		}
-
-		result = append(result, geoHit)
+		result = append(result, hit)
 	}
 
 	return result, nil
+}
+
+// sourceToGeoHit преобразует _source в GeoHit
+func (c *ManticoreClient) sourceToGeoHit(source map[string]interface{}) (domain.GeoHit, error) {
+	var geoHit domain.GeoHit
+
+	// ID
+	if id, ok := source["id"]; ok {
+		switch v := id.(type) {
+		case float64:
+			geoHit.ID = uint64(v)
+		case uint64:
+			geoHit.ID = v
+		case int64:
+			geoHit.ID = uint64(v)
+		}
+	}
+
+	// Name
+	if name, ok := source["name"].(string); ok {
+		geoHit.Name = name
+	}
+
+	// GeohashesString
+	if geohashes, ok := source["geohashes_string"].(string); ok {
+		geoHit.GeohashesString = geohashes
+	}
+
+	// GeohashesUint64 - может быть массивом или строкой
+	if geohashesUint, ok := source["geohashes_uint64"]; ok {
+		switch v := geohashesUint.(type) {
+		case []interface{}:
+			geoHit.GeohashesUint64 = make([]uint64, len(v))
+			for i, val := range v {
+				if f, ok := val.(float64); ok {
+					geoHit.GeohashesUint64[i] = uint64(f)
+				}
+			}
+		}
+	}
+
+	// Occurrences
+	if occ, ok := source["occurrences"]; ok {
+		switch v := occ.(type) {
+		case float64:
+			geoHit.Occurrences = int(v)
+		case int:
+			geoHit.Occurrences = v
+		}
+	}
+
+	// FirstGeonameID
+	if firstID, ok := source["first_geoname_id"]; ok {
+		switch v := firstID.(type) {
+		case float64:
+			geoHit.FirstGeonameID = uint64(v)
+		case uint64:
+			geoHit.FirstGeonameID = v
+		case int64:
+			geoHit.FirstGeonameID = uint64(v)
+		}
+	}
+
+	return geoHit, nil
+}
+
+// rowToGeoHit преобразует сырую строку в GeoHit
+func (c *ManticoreClient) rowToGeoHit(row map[string]interface{}) (domain.GeoHit, error) {
+	var geoHit domain.GeoHit
+
+	// В сыром ответе поля могут быть прямо в корне
+	if id, ok := row["id"]; ok {
+		switch v := id.(type) {
+		case float64:
+			geoHit.ID = uint64(v)
+		}
+	}
+
+	if name, ok := row["name"].(string); ok {
+		geoHit.Name = name
+	}
+
+	if geohashes, ok := row["geohashes_string"].(string); ok {
+		geoHit.GeohashesString = geohashes
+	}
+
+	if geohashesUint, ok := row["geohashes_uint64"]; ok {
+		switch v := geohashesUint.(type) {
+		case []interface{}:
+			geoHit.GeohashesUint64 = make([]uint64, len(v))
+			for i, val := range v {
+				if f, ok := val.(float64); ok {
+					geoHit.GeohashesUint64[i] = uint64(f)
+				}
+			}
+		}
+	}
+
+	if occ, ok := row["occurrences"]; ok {
+		switch v := occ.(type) {
+		case float64:
+			geoHit.Occurrences = int(v)
+		}
+	}
+
+	if firstID, ok := row["first_geoname_id"]; ok {
+		switch v := firstID.(type) {
+		case float64:
+			geoHit.FirstGeonameID = uint64(v)
+		}
+	}
+
+	return geoHit, nil
 }
 
 // FindOne выполняет поиск одной сущности
