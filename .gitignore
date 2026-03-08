@@ -23,3 +23,6 @@
 *.tmp
 *.temp
 /csv-import/
+
+# Checkpoint files
+*.checkpoint
