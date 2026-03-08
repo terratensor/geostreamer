@@ -1,0 +1,25 @@
+# Binaries
+/geostreamer
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output files
+*.json
+*.ndjson
+*.log
+*.checkpoint
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
+/csv-import/
