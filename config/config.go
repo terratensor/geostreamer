@@ -26,6 +26,7 @@ type Config struct {
 		CacheTTL   time.Duration
 		BatchSize  int
 		Workers    int
+		DebugMode  bool
 	}
 }
 
@@ -51,6 +52,7 @@ func Load() *Config {
 	flag.DurationVar(&cfg.Manticore.CacheTTL, "manticore-cache-ttl", 1*time.Hour, "Manticore cache TTL")
 	flag.IntVar(&cfg.Manticore.BatchSize, "manticore-batch", 100, "Manticore batch query size")
 	flag.IntVar(&cfg.Manticore.Workers, "manticore-workers", 10, "Number of parallel Manticore workers")
+	flag.BoolVar(&cfg.Manticore.DebugMode, "manticore-debug", false, "Manticore client debug mode")
 
 	flag.Parse()
 

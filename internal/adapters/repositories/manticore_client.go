@@ -12,15 +12,6 @@ import (
 	"github.com/terratensor/geostreamer/internal/core/domain"
 )
 
-// ManticoreClient реализует интерфейс GeonameRepository
-type ManticoreClient struct {
-	apiClient   *Manticoresearch.APIClient
-	indexName   string
-	config      Config
-	cache       *QueryCache
-	requestPool *sync.Pool
-}
-
 // Config конфигурация клиента Manticore
 type Config struct {
 	BaseURL    string        // например "http://localhost:9308"
@@ -32,6 +23,7 @@ type Config struct {
 	CacheTTL   time.Duration // время жизни кэша
 	BatchSize  int           // максимальный размер батча для запроса
 	Workers    int           // количество параллельных воркеров
+	DebugMode  bool          // режим отладки
 }
 
 // QueryCache простой кэш для результатов запросов
@@ -89,6 +81,15 @@ func (c *QueryCache) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.items, key)
+}
+
+// ManticoreClient реализует интерфейс GeonameRepository
+type ManticoreClient struct {
+	apiClient   *Manticoresearch.APIClient
+	indexName   string
+	config      Config
+	cache       *QueryCache
+	requestPool *sync.Pool
 }
 
 // NewManticoreClient создает новый клиент Manticore

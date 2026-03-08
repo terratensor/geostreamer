@@ -47,6 +47,7 @@ func main() {
 		CacheTTL:   cfg.Manticore.CacheTTL,
 		BatchSize:  cfg.Manticore.BatchSize,
 		Workers:    cfg.Manticore.Workers,
+		DebugMode:  cfg.Manticore.DebugMode,
 	}
 
 	repo, err := repositories.NewManticoreClient(manticoreCfg)
