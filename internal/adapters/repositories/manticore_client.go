@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -95,8 +96,27 @@ type ManticoreClient struct {
 // NewManticoreClient создает новый клиент Manticore
 func NewManticoreClient(cfg Config) (*ManticoreClient, error) {
 	configuration := Manticoresearch.NewConfiguration()
-	configuration.Servers[0].URL = cfg.BaseURL
-	configuration.HTTPClient.Timeout = cfg.Timeout
+
+	// Устанавливаем URL сервера
+	if len(configuration.Servers) > 0 {
+		configuration.Servers[0].URL = cfg.BaseURL
+	}
+
+	// ВАЖНО: HTTPClient изначально nil, нужно создать новый
+	configuration.HTTPClient = &http.Client{
+		Timeout: cfg.Timeout,
+	}
+
+	// Проверяем соединение (опционально)
+	if cfg.DebugMode {
+		resp, err := configuration.HTTPClient.Get(cfg.BaseURL)
+		if err != nil {
+			log.Printf("Warning: cannot connect to Manticore at %s: %v", cfg.BaseURL, err)
+		} else {
+			defer resp.Body.Close()
+			log.Printf("Connected to Manticore at %s (status: %s)", cfg.BaseURL, resp.Status)
+		}
+	}
 
 	apiClient := Manticoresearch.NewAPIClient(configuration)
 
