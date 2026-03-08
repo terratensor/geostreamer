@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Manager управляет сохранением и загрузкой чекпоинтов
@@ -15,8 +16,11 @@ type Manager struct {
 
 // Checkpoint представляет сохраненное состояние
 type Checkpoint struct {
-	Offset     int64 `json:"offset"`      // смещение в файле
-	LineNumber int64 `json:"line_number"` // номер строки
+	Offset       int64     `json:"offset"`        // смещение в файле
+	LineNumber   int64     `json:"line_number"`   // номер строки
+	SkippedLines int64     `json:"skipped_lines"` // пропущено строк
+	Timestamp    time.Time `json:"timestamp"`     // время сохранения
+	Version      string    `json:"version"`       // версия формата
 }
 
 // NewManager создает новый менеджер чекпоинтов
@@ -39,9 +43,11 @@ func (m *Manager) Save(offset, lineNum int64) error {
 	checkpoint := Checkpoint{
 		Offset:     offset,
 		LineNumber: lineNum,
+		Timestamp:  time.Now(),
+		Version:    "1.0",
 	}
 
-	data, err := json.Marshal(checkpoint)
+	data, err := json.MarshalIndent(checkpoint, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -63,7 +69,12 @@ func (m *Manager) Load() (*Checkpoint, error) {
 	data, err := os.ReadFile(m.filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &Checkpoint{Offset: 0, LineNumber: 0}, nil
+			return &Checkpoint{
+				Offset:     0,
+				LineNumber: 0,
+				Timestamp:  time.Now(),
+				Version:    "1.0",
+			}, nil
 		}
 		return nil, err
 	}
@@ -85,4 +96,9 @@ func (m *Manager) Clear() error {
 		return err
 	}
 	return nil
+}
+
+// GetPath возвращает путь к файлу чекпоинта
+func (m *Manager) GetPath() string {
+	return m.filePath
 }

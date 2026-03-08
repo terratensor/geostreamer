@@ -24,15 +24,19 @@ type CSVReader struct {
 	reader        *csv.Reader
 	currentLine   int64
 	currentOffset int64
+	skippedLines  int64
+	strictMode    bool // если true - останавливаться при ошибках, false - пропускать
 }
 
 // NewCSVReader создает новый CSVReader
-func NewCSVReader(filePath string, delimiter rune, batchSize int, checkpointPath string) (*CSVReader, error) {
+func NewCSVReader(filePath string, delimiter rune, batchSize int, checkpointPath string, strictMode bool) (*CSVReader, error) {
 	reader := &CSVReader{
 		filePath:      filePath,
 		delimiter:     delimiter,
 		batchSize:     batchSize,
 		checkpointMgr: checkpoint.NewManager(checkpointPath),
+		strictMode:    strictMode,
+		skippedLines:  0,
 	}
 
 	if err := reader.init(); err != nil {
@@ -71,8 +75,9 @@ func (r *CSVReader) init() error {
 	// Создаем CSV reader с буфером
 	r.reader = csv.NewReader(bufio.NewReaderSize(r.file, 1024*1024)) // 1MB буфер
 	r.reader.Comma = r.delimiter
-	r.reader.ReuseRecord = true   // Важно для производительности!
-	r.reader.FieldsPerRecord = -1 // Разрешаем переменное количество полей
+	r.reader.ReuseRecord = true      // Важно для производительности!
+	r.reader.FieldsPerRecord = -1    // Разрешаем переменное количество полей
+	r.reader.TrimLeadingSpace = true // Обрезаем пробелы
 
 	// Пропускаем заголовок, если мы в начале файла
 	if cp.Offset == 0 {
@@ -82,6 +87,12 @@ func (r *CSVReader) init() error {
 		}
 		r.currentLine++
 		r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
+	}
+
+	// Логируем информацию о старте
+	fmt.Printf("Starting from line %d (offset: %d)\n", r.currentLine+1, r.currentOffset)
+	if r.skippedLines > 0 {
+		fmt.Printf("Previously skipped lines: %d\n", r.skippedLines)
 	}
 
 	return nil
@@ -97,6 +108,7 @@ func (r *CSVReader) ReadRecords(ctx context.Context) (<-chan domain.CSVRecord, <
 		defer close(errChan)
 
 		batch := make([]domain.CSVRecord, 0, r.batchSize)
+		recordsInCurrentBatch := 0
 
 		for {
 			select {
@@ -104,33 +116,61 @@ func (r *CSVReader) ReadRecords(ctx context.Context) (<-chan domain.CSVRecord, <
 				errChan <- ctx.Err()
 				return
 			default:
+				// Пытаемся прочитать следующую запись
 				record, err := r.readNextRecord()
 				if err == io.EOF {
 					// Отправляем последний батч, если он не пустой
 					if len(batch) > 0 {
 						r.sendBatch(ctx, batch, recordsChan)
 					}
-					return
-				}
-				if err != nil {
-					errChan <- fmt.Errorf("error reading record at line %d: %w", r.currentLine+1, err)
+
+					// Сохраняем финальный чекпоинт
+					if err := r.saveCheckpoint(); err != nil {
+						errChan <- fmt.Errorf("failed to save final checkpoint: %w", err)
+					}
+
+					fmt.Printf("Finished processing. Total records: %d, Skipped lines: %d\n",
+						r.currentLine, r.skippedLines)
 					return
 				}
 
+				// Обрабатываем ошибки чтения
+				if err != nil {
+					// Проверяем, является ли ошибка критической
+					if r.isCriticalError(err) {
+						errChan <- fmt.Errorf("critical error at line ~%d: %w", r.currentLine+1, err)
+						return
+					}
+
+					// Пропускаем битую строку
+					r.skippedLines++
+					fmt.Printf("Warning: skipped line %d (invalid format): %v\n", r.currentLine+1, err)
+					continue
+				}
+
+				// Валидная запись - добавляем в батч
 				batch = append(batch, record)
+				recordsInCurrentBatch++
 
 				// Если набрали батч, отправляем
 				if len(batch) >= r.batchSize {
 					if !r.sendBatch(ctx, batch, recordsChan) {
 						return
 					}
-					batch = batch[:0]
 
 					// Сохраняем чекпоинт после каждого батча
 					if err := r.saveCheckpoint(); err != nil {
 						errChan <- fmt.Errorf("failed to save checkpoint: %w", err)
 						return
 					}
+
+					// Очищаем батч и сбрасываем счетчик
+					batch = batch[:0]
+					recordsInCurrentBatch = 0
+
+					// Логируем прогресс
+					fmt.Printf("Processed %d records, skipped %d lines...\n",
+						r.currentLine, r.skippedLines)
 				}
 			}
 		}
@@ -139,14 +179,37 @@ func (r *CSVReader) ReadRecords(ctx context.Context) (<-chan domain.CSVRecord, <
 	return recordsChan, errChan
 }
 
+// isCriticalError определяет, является ли ошибка критической
+func (r *CSVReader) isCriticalError(err error) bool {
+	// В строгом режиме все ошибки критические
+	if r.strictMode {
+		return true
+	}
+
+	// Определяем типы ошибок, которые можно пропустить
+	switch e := err.(type) {
+	case *csv.ParseError:
+		// Ошибки парсинга CSV можно пропустить (битые строки)
+		return false
+	default:
+		// Другие ошибки (проблемы с файлом и т.д.) - критические
+		return !strings.Contains(err.Error(), "wrong number of fields") &&
+			!strings.Contains(err.Error(), "bare quote") &&
+			!strings.Contains(err.Error(), "invalid record length")
+	}
+}
+
 // readNextRecord читает и парсит следующую запись
 func (r *CSVReader) readNextRecord() (domain.CSVRecord, error) {
+	// Сохраняем позицию перед чтением
+	posBefore, _ := r.file.Seek(0, io.SeekCurrent)
+
 	record, err := r.reader.Read()
 	if err != nil {
 		return domain.CSVRecord{}, err
 	}
 
-	// Обновляем смещение и номер строки
+	// Обновляем смещение и номер строки только после успешного чтения
 	r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
 	r.currentLine++
 
@@ -157,22 +220,27 @@ func (r *CSVReader) readNextRecord() (domain.CSVRecord, error) {
 // parseRecord преобразует []string в domain.CSVRecord
 func (r *CSVReader) parseRecord(record []string) (domain.CSVRecord, error) {
 	if len(record) < 6 {
-		return domain.CSVRecord{}, fmt.Errorf("invalid record length: %d", len(record))
+		return domain.CSVRecord{}, fmt.Errorf("invalid record length: expected >=6, got %d", len(record))
+	}
+
+	// Очищаем поля от кавычек и пробелов
+	for i := range record {
+		record[i] = strings.Trim(record[i], "\" ")
 	}
 
 	confidence, err := strconv.ParseFloat(record[3], 64)
 	if err != nil {
-		return domain.CSVRecord{}, fmt.Errorf("invalid confidence value: %s", record[3])
+		return domain.CSVRecord{}, fmt.Errorf("invalid confidence value '%s': %w", record[3], err)
 	}
 
 	startPos, err := strconv.Atoi(record[4])
 	if err != nil {
-		return domain.CSVRecord{}, fmt.Errorf("invalid start_pos value: %s", record[4])
+		return domain.CSVRecord{}, fmt.Errorf("invalid start_pos value '%s': %w", record[4], err)
 	}
 
 	endPos, err := strconv.Atoi(record[5])
 	if err != nil {
-		return domain.CSVRecord{}, fmt.Errorf("invalid end_pos value: %s", record[5])
+		return domain.CSVRecord{}, fmt.Errorf("invalid end_pos value '%s': %w", record[5], err)
 	}
 
 	return domain.CSVRecord{
@@ -206,6 +274,11 @@ func (r *CSVReader) saveCheckpoint() error {
 // GetProgress возвращает текущий прогресс
 func (r *CSVReader) GetProgress() int64 {
 	return r.currentLine
+}
+
+// GetSkippedLines возвращает количество пропущенных строк
+func (r *CSVReader) GetSkippedLines() int64 {
+	return r.skippedLines
 }
 
 // Close закрывает файл
