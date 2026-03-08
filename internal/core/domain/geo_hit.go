@@ -1,5 +1,9 @@
 package domain
 
+import (
+	"strings" // Добавляем недостающий импорт
+)
+
 // GeoHit представляет результат поиска из Manticore
 type GeoHit struct {
 	ID              uint64   `json:"id"`
@@ -13,16 +17,16 @@ type GeoHit struct {
 // ToGeoResult преобразует хит в часть результата агрегации
 func (h *GeoHit) ToGeoResult() ([]string, []uint64) {
 	// Парсим строку с геохешами
-	var strings []string
+	var strings_list []string
 	if h.GeohashesString != "" {
 		// Разделяем по запятой
 		for _, part := range strings.Split(h.GeohashesString, ",") {
 			trimmed := strings.TrimSpace(part)
 			if trimmed != "" {
-				strings = append(strings, trimmed)
+				strings_list = append(strings_list, trimmed)
 			}
 		}
 	}
 
-	return strings, h.GeohashesUint64
+	return strings_list, h.GeohashesUint64
 }
