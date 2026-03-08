@@ -91,9 +91,6 @@ func (r *CSVReader) init() error {
 
 	// Логируем информацию о старте
 	fmt.Printf("Starting from line %d (offset: %d)\n", r.currentLine+1, r.currentOffset)
-	if r.skippedLines > 0 {
-		fmt.Printf("Previously skipped lines: %d\n", r.skippedLines)
-	}
 
 	return nil
 }
@@ -108,7 +105,6 @@ func (r *CSVReader) ReadRecords(ctx context.Context) (<-chan domain.CSVRecord, <
 		defer close(errChan)
 
 		batch := make([]domain.CSVRecord, 0, r.batchSize)
-		recordsInCurrentBatch := 0
 
 		for {
 			select {
@@ -150,7 +146,6 @@ func (r *CSVReader) ReadRecords(ctx context.Context) (<-chan domain.CSVRecord, <
 
 				// Валидная запись - добавляем в батч
 				batch = append(batch, record)
-				recordsInCurrentBatch++
 
 				// Если набрали батч, отправляем
 				if len(batch) >= r.batchSize {
@@ -164,9 +159,8 @@ func (r *CSVReader) ReadRecords(ctx context.Context) (<-chan domain.CSVRecord, <
 						return
 					}
 
-					// Очищаем батч и сбрасываем счетчик
+					// Очищаем батч
 					batch = batch[:0]
-					recordsInCurrentBatch = 0
 
 					// Логируем прогресс
 					fmt.Printf("Processed %d records, skipped %d lines...\n",
@@ -187,29 +181,21 @@ func (r *CSVReader) isCriticalError(err error) bool {
 	}
 
 	// Определяем типы ошибок, которые можно пропустить
-	switch e := err.(type) {
-	case *csv.ParseError:
-		// Ошибки парсинга CSV можно пропустить (битые строки)
-		return false
-	default:
-		// Другие ошибки (проблемы с файлом и т.д.) - критические
-		return !strings.Contains(err.Error(), "wrong number of fields") &&
-			!strings.Contains(err.Error(), "bare quote") &&
-			!strings.Contains(err.Error(), "invalid record length")
-	}
+	errStr := err.Error()
+	return !strings.Contains(errStr, "wrong number of fields") &&
+		!strings.Contains(errStr, "bare quote") &&
+		!strings.Contains(errStr, "invalid record length") &&
+		!strings.Contains(errStr, "line break")
 }
 
 // readNextRecord читает и парсит следующую запись
 func (r *CSVReader) readNextRecord() (domain.CSVRecord, error) {
-	// Сохраняем позицию перед чтением
-	posBefore, _ := r.file.Seek(0, io.SeekCurrent)
-
 	record, err := r.reader.Read()
 	if err != nil {
 		return domain.CSVRecord{}, err
 	}
 
-	// Обновляем смещение и номер строки только после успешного чтения
+	// Обновляем смещение и номер строки
 	r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
 	r.currentLine++
 
