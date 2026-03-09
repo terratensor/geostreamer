@@ -166,15 +166,28 @@ func (o *Orchestrator) printStats() {
 	elapsed := time.Since(o.startTime)
 	rate := float64(o.processed) / elapsed.Seconds()
 
+	// Создаем структуру Stats из пакета logger
+	stats := logger.Stats{
+		ProcessedRecords: o.processed,
+		SkippedRecords:   o.skipped,
+		WrittenRecords:   writerStats.RecordsWritten,
+		BytesWritten:     writerStats.BytesWritten,
+		ManticoreSuccess: manticoreSuccess,
+		ManticoreFailure: manticoreFailure,
+		ProcessingTime:   elapsed,
+		RecordsPerSecond: rate,
+	}
+
+	// Добавляем информацию о фильтрации отдельно, так как её нет в Stats
 	o.log.Info("=== STATISTICS ===")
 	o.log.Info("Entity types: %v", o.getEntityTypesList())
-	o.log.Info("Processed (with geohashes): %d records", o.processed)
-	o.log.Info("Skipped (not found in Manticore): %d records", o.skipped)
+	o.log.Info("Processed (with geohashes): %d records", stats.ProcessedRecords)
+	o.log.Info("Skipped (not found in Manticore): %d records", stats.SkippedRecords)
 	o.log.Info("Filtered (other entity types): %d records", o.filtered)
-	o.log.Info("Written: %d records", writerStats.RecordsWritten)
-	o.log.Info("Bytes written: %d", writerStats.BytesWritten)
-	o.log.Info("Manticore: %d success, %d failures", manticoreSuccess, manticoreFailure)
-	o.log.Info("Rate: %.2f records/sec", rate)
+	o.log.Info("Written: %d records", stats.WrittenRecords)
+	o.log.Info("Bytes written: %d", stats.BytesWritten)
+	o.log.Info("Manticore: %d success, %d failures", stats.ManticoreSuccess, stats.ManticoreFailure)
+	o.log.Info("Rate: %.2f records/sec", stats.RecordsPerSecond)
 	o.log.Info("=================")
 }
 
@@ -193,16 +206,27 @@ func (o *Orchestrator) printFinalStats() {
 	elapsed := time.Since(o.startTime)
 	rate := float64(o.processed) / elapsed.Seconds()
 
+	stats := logger.Stats{
+		ProcessedRecords: o.processed,
+		SkippedRecords:   o.skipped,
+		WrittenRecords:   writerStats.RecordsWritten,
+		BytesWritten:     writerStats.BytesWritten,
+		ManticoreSuccess: manticoreSuccess,
+		ManticoreFailure: manticoreFailure,
+		ProcessingTime:   elapsed,
+		RecordsPerSecond: rate,
+	}
+
 	o.log.Info("=== FINAL STATISTICS ===")
 	o.log.Info("Entity types processed: %v", o.getEntityTypesList())
-	o.log.Info("Total processing time: %v", elapsed)
-	o.log.Info("Records processed (with geohashes): %d", o.processed)
-	o.log.Info("Records skipped (not found in Manticore): %d", o.skipped)
+	o.log.Info("Total processing time: %v", stats.ProcessingTime)
+	o.log.Info("Records processed (with geohashes): %d", stats.ProcessedRecords)
+	o.log.Info("Records skipped (not found in Manticore): %d", stats.SkippedRecords)
 	o.log.Info("Records filtered (other types): %d", o.filtered)
-	o.log.Info("Records written: %d", writerStats.RecordsWritten)
-	o.log.Info("Bytes written: %d", writerStats.BytesWritten)
-	o.log.Info("Manticore queries: %d success, %d failures", manticoreSuccess, manticoreFailure)
-	o.log.Info("Processing rate: %.2f records/sec", rate)
+	o.log.Info("Records written: %d", stats.WrittenRecords)
+	o.log.Info("Bytes written: %d", stats.BytesWritten)
+	o.log.Info("Manticore queries: %d success, %d failures", stats.ManticoreSuccess, stats.ManticoreFailure)
+	o.log.Info("Processing rate: %.2f records/sec", stats.RecordsPerSecond)
 	o.log.Info("========================")
 }
 
