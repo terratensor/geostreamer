@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/terratensor/geostreamer/internal/core/domain"
 )
@@ -18,6 +19,8 @@ type DebugWriter struct {
 	failuresWriter *bufio.Writer
 	skippedWriter  *bufio.Writer
 	mu             sync.Mutex
+	flushInterval  time.Duration
+	lastFlush      time.Time
 }
 
 // NewDebugWriter создает новый DebugWriter
@@ -42,11 +45,16 @@ func NewDebugWriter(failuresPath, skippedPath string) (*DebugWriter, error) {
 		return nil, fmt.Errorf("failed to open skipped file: %w", err)
 	}
 
+	// Уменьшаем буфер для немедленной записи (8KB вместо 1MB)
+	bufferSize := 8 * 1024
+
 	return &DebugWriter{
 		failuresFile:   failuresFile,
 		skippedFile:    skippedFile,
-		failuresWriter: bufio.NewWriterSize(failuresFile, 1024*1024),
-		skippedWriter:  bufio.NewWriterSize(skippedFile, 1024*1024),
+		failuresWriter: bufio.NewWriterSize(failuresFile, bufferSize),
+		skippedWriter:  bufio.NewWriterSize(skippedFile, bufferSize),
+		flushInterval:  1 * time.Second, // Сбрасываем каждую секунду
+		lastFlush:      time.Now(),
 	}, nil
 }
 
@@ -65,6 +73,17 @@ func (w *DebugWriter) WriteFailed(record *domain.FailedRecord) error {
 	}
 	if _, err := w.failuresWriter.Write([]byte{'\n'}); err != nil {
 		return err
+	}
+
+	// Сбрасываем буфер если прошло больше интервала
+	if time.Since(w.lastFlush) > w.flushInterval {
+		if err := w.failuresWriter.Flush(); err != nil {
+			return err
+		}
+		if err := w.failuresFile.Sync(); err != nil {
+			return err
+		}
+		w.lastFlush = time.Now()
 	}
 
 	return nil
@@ -87,6 +106,17 @@ func (w *DebugWriter) WriteSkipped(record *domain.SkippedRecord) error {
 		return err
 	}
 
+	// Сбрасываем буфер если прошло больше интервала
+	if time.Since(w.lastFlush) > w.flushInterval {
+		if err := w.skippedWriter.Flush(); err != nil {
+			return err
+		}
+		if err := w.skippedFile.Sync(); err != nil {
+			return err
+		}
+		w.lastFlush = time.Now()
+	}
+
 	return nil
 }
 
@@ -101,6 +131,13 @@ func (w *DebugWriter) Flush() error {
 	if err := w.skippedWriter.Flush(); err != nil {
 		return err
 	}
+	if err := w.failuresFile.Sync(); err != nil {
+		return err
+	}
+	if err := w.skippedFile.Sync(); err != nil {
+		return err
+	}
+	w.lastFlush = time.Now()
 	return nil
 }
 
