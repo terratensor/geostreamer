@@ -211,8 +211,6 @@ doc_id|entity_type|entity_text|confidence|start_pos|end_pos
 SELECT * FROM geoname_dict WHERE match('"^entity_text$"')
 ```
 
-Вот секция с примером статистики для README.md:
-
 ### Статистика выполнения
 
 В процессе работы и по завершении утилита выводит подробную статистику:
@@ -259,8 +257,6 @@ SELECT * FROM geoname_dict WHERE match('"^entity_text$"')
 | **Manticore** | Статистика запросов к Manticore (успешно/ошибки) |
 | **Rate** | Скорость обработки записей в секунду |
 | **Total processing time** | Общее время выполнения |
-
-Вот дополнение к секции статистики с анализом производительности:
 
 ### Анализ производительности
 
