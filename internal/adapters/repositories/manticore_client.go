@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -186,25 +185,6 @@ func (c *ManticoreClient) FindBatch(ctx context.Context, entityTexts []string) (
 	return result, nil
 }
 
-// filterCached фильтрует кэшированные запросы
-func (c *ManticoreClient) filterCached(texts []string, result map[string][]domain.GeoHit) []string {
-	if c.cache == nil {
-		return texts
-	}
-
-	uncached := make([]string, 0, len(texts))
-
-	for _, text := range texts {
-		if hits, ok := c.cache.Get(text); ok {
-			result[text] = hits
-		} else {
-			uncached = append(uncached, text)
-		}
-	}
-
-	return uncached
-}
-
 // executeBatchQuery выполняет групповой запрос к Manticore
 func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string) ([]domain.GeoHit, error) {
 	if len(texts) == 0 {
@@ -342,33 +322,6 @@ func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string) (
 	}
 
 	return c.parseResponse(resp)
-}
-
-// saveFailedQuery сохраняет проблемный запрос в файл
-func (c *ManticoreClient) saveFailedQuery(query string, texts []string, status, body string) {
-	filename := fmt.Sprintf("failed_query_%d.log", time.Now().UnixNano())
-
-	content := fmt.Sprintf("Timestamp: %s\nStatus: %s\n\nTexts: %v\n\nQuery: %s\n\nResponse: %s\n",
-		time.Now().Format(time.RFC3339),
-		status,
-		texts,
-		query,
-		body,
-	)
-
-	if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
-		log.Printf("Failed to save failed query: %v", err)
-	} else {
-		log.Printf("Saved failed query to %s", filename)
-	}
-}
-
-// min вспомогательная функция
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // escapeString экранирует спецсимволы для Manticore
