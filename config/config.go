@@ -72,8 +72,8 @@ func Load() *Config {
 	flag.DurationVar(&cfg.Manticore.RetryDelay, "manticore-retry-delay", 2*time.Second, "Delay between retries")
 	flag.IntVar(&cfg.Manticore.CacheSize, "manticore-cache-size", 10000, "Manticore query cache size")
 	flag.DurationVar(&cfg.Manticore.CacheTTL, "manticore-cache-ttl", 1*time.Hour, "Manticore cache TTL")
-	flag.IntVar(&cfg.Manticore.BatchSize, "manticore-batch", 100, "Manticore batch query size")
-	flag.IntVar(&cfg.Manticore.Workers, "manticore-workers", 10, "Number of parallel Manticore workers")
+	flag.IntVar(&cfg.Manticore.BatchSize, "manticore-batch", 500, "Manticore batch query size")
+	flag.IntVar(&cfg.Manticore.Workers, "manticore-workers", 20, "Number of parallel Manticore workers")
 	flag.BoolVar(&cfg.Manticore.DebugMode, "manticore-debug", false, "Manticore client debug mode")
 	flag.IntVar(&cfg.Manticore.ParallelQueries, "manticore-parallel", 20, "Number of parallel queries per batch")
 
