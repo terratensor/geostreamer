@@ -333,6 +333,9 @@ func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string, w
 			Execute()
 
 		if err == nil {
+			c.mu.Lock()
+			c.successCount++
+			c.mu.Unlock()
 			break
 		}
 
