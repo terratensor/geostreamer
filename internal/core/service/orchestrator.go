@@ -152,7 +152,8 @@ func (o *Orchestrator) printStats() {
 	}
 
 	elapsed := time.Since(o.startTime)
-	rate := float64(o.processed+o.skipped+o.filtered) / elapsed.Seconds()
+	totalRecords := o.processed + o.skipped + o.filtered
+	rate := float64(totalRecords) / elapsed.Seconds()
 
 	o.log.Info("=== STATISTICS ===")
 	o.log.Info("Entity types: %v", o.getEntityTypesList())
@@ -179,7 +180,8 @@ func (o *Orchestrator) printFinalStats() {
 	}
 
 	elapsed := time.Since(o.startTime)
-	rate := float64(o.processed+o.skipped+o.filtered) / elapsed.Seconds()
+	totalRecords := o.processed + o.skipped + o.filtered
+	rate := float64(totalRecords) / elapsed.Seconds()
 
 	o.log.Info("=== FINAL STATISTICS ===")
 	o.log.Info("Entity types processed: %v", o.getEntityTypesList())
@@ -249,15 +251,16 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int,
 
 	workerLog := o.log.WithPrefix(fmt.Sprintf("Worker-%d", workerID))
 
-	// Собираем все тексты для запроса (уникальные)
-	texts := make([]string, 0, len(batchMap))
+	// 1. Собираем уникальные тексты для запроса
+	uniqueTexts := make([]string, 0, len(batchMap))
 	for text := range batchMap {
-		texts = append(texts, text)
+		uniqueTexts = append(uniqueTexts, text)
 	}
 
-	// Фильтруем по типу: определяем, какие тексты нужно обрабатывать
+	// 2. Фильтруем по типу: определяем, какие тексты нужно обрабатывать
 	filteredTexts := make([]string, 0)
 	filteredMap := make(map[string][]domain.CSVRecord) // только для выбранных типов
+	var filteredCount int64
 
 	for text, records := range batchMap {
 		// Проверяем, есть ли среди записей хотя бы одна с нужным типом
@@ -274,19 +277,22 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int,
 			filteredMap[text] = records
 		} else {
 			// Все записи этого текста не подходят по типу
-			o.mu.Lock()
-			o.filtered += int64(len(records))
-			o.mu.Unlock()
-
-			// В skipped файл не пишем, так как это не выбранный тип
+			filteredCount += int64(len(records))
 		}
+	}
+
+	// Обновляем счетчик filtered
+	if filteredCount > 0 {
+		o.mu.Lock()
+		o.filtered += filteredCount
+		o.mu.Unlock()
 	}
 
 	if len(filteredTexts) == 0 {
 		return
 	}
 
-	// Выполняем запрос к Manticore для уникальных текстов
+	// 3. Выполняем запрос к Manticore для уникальных текстов
 	var hitsMap map[string][]domain.GeoHit
 	var infoMap map[string]*repositories.QueryInfo
 	var err error
@@ -311,73 +317,75 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int,
 		return
 	}
 
-	// Обрабатываем результаты для каждого текста
+	// 4. Локальная агрегация по doc_id (ОДИН результат на doc_id)
+	docResults := make(map[string]*domain.GeoResult)
+
+	// Счетчики для статистики
+	var processedInBatch, skippedInBatch int64
+
 	for text, records := range filteredMap {
 		hits := hitsMap[text]
-		info := infoMap[text] // может быть nil для fallback
+		info := infoMap[text]
 
-		if len(hits) == 0 {
-			// Не найдено в Manticore — все записи этого текста идут в skipped
-			o.mu.Lock()
-			o.skipped += int64(len(records))
-			o.mu.Unlock()
-
-			// Пишем в skipped файл для каждой записи
-			for _, rec := range records {
-				o.writeSkippedFromInfo(rec, info, "not_found_in_manticore")
-			}
-			continue
-		}
-
-		// Проверяем, есть ли геохеши в найденных хитов
-		hasGeohashes := false
-		for _, hit := range hits {
-			strs, uints := hit.ToGeoResult()
-			if len(strs) > 0 || len(uints) > 0 {
-				hasGeohashes = true
-				break
-			}
-		}
-
-		if hasGeohashes {
-			// Успех — группируем записи по doc_id для агрегации
-			tempResults := make(map[string]*domain.GeoResult)
-
-			for _, rec := range records {
-				if _, exists := tempResults[rec.DocID]; !exists {
-					tempResults[rec.DocID] = domain.NewGeoResult(rec.DocID)
+		// Проверяем, есть ли геохеши в хитах
+		hasGeo := false
+		if len(hits) > 0 {
+			for _, hit := range hits {
+				strs, uints := hit.ToGeoResult()
+				if len(strs) > 0 || len(uints) > 0 {
+					hasGeo = true
+					break
 				}
-				// Добавляем геохеши из всех хитов (хиты одни для всех записей с этим текстом)
+			}
+		}
+
+		if hasGeo {
+			// ЕСТЬ геохеши - обрабатываем все строки
+			processedInBatch += int64(len(records))
+
+			// Для каждой записи добавляем геохеши в результат ее doc_id
+			for _, rec := range records {
+				// Получаем или создаем результат для этого doc_id
+				res, exists := docResults[rec.DocID]
+				if !exists {
+					res = domain.NewGeoResult(rec.DocID)
+					docResults[rec.DocID] = res
+				}
+
+				// Добавляем геохеши из всех хитов
 				for _, hit := range hits {
 					strs, uints := hit.ToGeoResult()
 					for _, s := range strs {
-						tempResults[rec.DocID].GeohashesStringMap[s] = struct{}{}
+						res.GeohashesStringMap[s] = struct{}{}
 					}
 					for _, u := range uints {
-						tempResults[rec.DocID].GeohashesUint64Map[u] = struct{}{}
+						res.GeohashesUint64Map[u] = struct{}{}
 					}
 				}
 			}
-
-			// Отправляем результаты
-			for _, res := range tempResults {
-				resultsChan <- res
-			}
-
-			o.mu.Lock()
-			o.processed += int64(len(records))
-			o.mu.Unlock()
 		} else {
-			// Хиты есть, но без геохешей — все записи в skipped
-			o.mu.Lock()
-			o.skipped += int64(len(records))
-			o.mu.Unlock()
+			// НЕТ геохешей - все строки в skipped
+			skippedInBatch += int64(len(records))
 
+			// Записываем в skipped файл для каждой записи
 			for _, rec := range records {
-				o.writeSkippedFromInfo(rec, info, "hit_without_geohashes")
+				o.writeSkippedFromInfo(rec, info, "not_found_in_manticore")
 			}
 		}
 	}
+
+	// 5. Отправляем результаты (ОДИН на doc_id)
+	for _, res := range docResults {
+		if len(res.GeohashesStringMap) > 0 || len(res.GeohashesUint64Map) > 0 {
+			resultsChan <- res
+		}
+	}
+
+	// 6. Обновляем глобальную статистику
+	o.mu.Lock()
+	o.processed += processedInBatch
+	o.skipped += skippedInBatch
+	o.mu.Unlock()
 }
 
 // writeSkippedFromInfo записывает skipped запись в файл (только для выбранных типов)
