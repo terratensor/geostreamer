@@ -157,31 +157,31 @@ doc_id|entity_type|entity_text|confidence|start_pos|end_pos
 
 ### Периодическая статистика (каждые 10 секунд)
 ```
-2026/03/09 19:13:52 [INFO] Orchestrator === STATISTICS ===
-2026/03/09 19:13:52 [INFO] Orchestrator Entity types: [LOC]
-2026/03/09 19:13:52 [INFO] Orchestrator Processed (with geohashes): 121561 records
-2026/03/09 19:13:52 [INFO] Orchestrator Skipped (not found in Manticore): 62130 records
-2026/03/09 19:13:52 [INFO] Orchestrator Filtered (other entity types): 409804 records
-2026/03/09 19:13:52 [INFO] Orchestrator Written: 46860 records
-2026/03/09 19:13:52 [INFO] Orchestrator Bytes written: 46950808
-2026/03/09 19:13:52 [INFO] Orchestrator Manticore: 81312 success, 0 failures
-2026/03/09 19:13:52 [INFO] Orchestrator Rate: 639.79 records/sec
-2026/03/09 19:13:52 [INFO] Orchestrator =================
+2026/03/09 23:55:48 [INFO] Orchestrator === STATISTICS ===
+2026/03/09 23:55:48 [INFO] Orchestrator Entity types: [LOC]
+2026/03/09 23:55:48 [INFO] Orchestrator Processed (with geohashes): 172095 records
+2026/03/09 23:55:48 [INFO] Orchestrator Skipped (not found in Manticore): 69326 records
+2026/03/09 23:55:48 [INFO] Orchestrator Filtered (other entity types): 584764 records
+2026/03/09 23:55:48 [INFO] Orchestrator Written (unique doc_id): 38270 records
+2026/03/09 23:55:48 [INFO] Orchestrator Bytes written: 64846342
+2026/03/09 23:55:48 [INFO] Orchestrator Manticore queries: 82874 success, 0 failures
+2026/03/09 23:55:48 [INFO] Orchestrator Rate: 9179.81 records/sec
+2026/03/09 23:55:48 [INFO] Orchestrator =================
 ```
 
 ### Финальная статистика (по завершении)
 ```
-2026/03/09 23:10:28 [INFO] Orchestrator === FINAL STATISTICS ===
-2026/03/09 23:10:28 [INFO] Orchestrator Entity types processed: [LOC]
-2026/03/09 23:10:28 [INFO] Orchestrator Total processing time: 1m39.751465178s
-2026/03/09 23:10:28 [INFO] Orchestrator Records processed (with geohashes): 236793
-2026/03/09 23:10:28 [INFO] Orchestrator Records skipped (not found in Manticore): 7759
-2026/03/09 23:10:28 [INFO] Orchestrator Records filtered (other types): 589302
-2026/03/09 23:10:28 [INFO] Orchestrator Records written (unique doc_id): 38875
-2026/03/09 23:10:28 [INFO] Orchestrator Bytes written: 65658695
-2026/03/09 23:10:28 [INFO] Orchestrator Manticore queries: 83631 success, 0 failures
-2026/03/09 23:10:28 [INFO] Orchestrator Processing rate: 8359.32 records/sec
-2026/03/09 23:10:28 [INFO] Orchestrator ========================
+2026/03/09 23:55:55 [INFO] Orchestrator === FINAL STATISTICS ===
+2026/03/09 23:55:55 [INFO] Orchestrator Entity types processed: [LOC]
+2026/03/09 23:55:55 [INFO] Orchestrator Total processing time: 1m36.812863154s
+2026/03/09 23:55:55 [INFO] Orchestrator Records processed (with geohashes): 174540
+2026/03/09 23:55:55 [INFO] Orchestrator Records skipped (not found in Manticore): 70012
+2026/03/09 23:55:55 [INFO] Orchestrator Records filtered (other types): 589302
+2026/03/09 23:55:55 [INFO] Orchestrator Records written (unique doc_id): 38874
+2026/03/09 23:55:55 [INFO] Orchestrator Bytes written: 65658650
+2026/03/09 23:55:55 [INFO] Orchestrator Manticore queries: 83568 success, 0 failures
+2026/03/09 23:55:55 [INFO] Orchestrator Processing rate: 8613.05 records/sec
+2026/03/09 23:55:55 [INFO] Orchestrator ========================
 ```
 
 ### Пояснение полей статистики
@@ -353,6 +353,20 @@ echo "Дубликатов: $(jq -r '.doc_id' results.ndjson | sort | uniq -d | 
 # Статистика по геохешам
 jq -r '.geohashes_string | length' results.ndjson | sort -n | uniq -c | tail -5
 ```
+
+## Итоговые метрики
+
+| Показатель | Значение |
+|------------|----------|
+| **Входные данные** | 833,854 записи |
+| **Время обработки** | 1м 36с |
+| **Скорость** | 8,613 записей/сек |
+| **LOC найдено** | 174,540 |
+| **LOC пропущено** | 70,012 |
+| **PER/ORG отфильтровано** | 589,302 |
+| **Уникальных doc_id** | 38,874 |
+| **Запросов к Manticore** | 83,568 |
+| **Ошибок** | 0 |
 
 ## Требования к Manticore
 
