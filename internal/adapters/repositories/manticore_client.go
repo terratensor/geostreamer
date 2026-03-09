@@ -3,6 +3,7 @@ package repositories
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -146,6 +147,36 @@ func NewManticoreClient(cfg Config) (*ManticoreClient, error) {
 func (c *ManticoreClient) FindBatch(ctx context.Context, entityTexts []string) (map[string][]domain.GeoHit, error) {
 	result := make(map[string][]domain.GeoHit)
 
+	// Manticore может иметь ограничение на длину запроса
+	// Если текстов слишком много, разбиваем на подбатчи
+	const maxBatchSize = 50 // эмпирическое значение, можно сделать конфигурируемым
+
+	if len(entityTexts) > maxBatchSize {
+		if c.config.DebugMode {
+			log.Printf("Large batch %d, splitting into chunks of %d", len(entityTexts), maxBatchSize)
+		}
+
+		for i := 0; i < len(entityTexts); i += maxBatchSize {
+			end := i + maxBatchSize
+			if end > len(entityTexts) {
+				end = len(entityTexts)
+			}
+
+			chunk := entityTexts[i:end]
+			chunkResult, err := c.FindBatch(ctx, chunk)
+			if err != nil {
+				return nil, err
+			}
+
+			// Объединяем результаты
+			for k, v := range chunkResult {
+				result[k] = v
+			}
+		}
+
+		return result, nil
+	}
+
 	// Разделяем на кэшированные и некэшированные запросы
 	uncached := c.filterCached(entityTexts, result)
 
@@ -161,14 +192,11 @@ func (c *ManticoreClient) FindBatch(ctx context.Context, entityTexts []string) (
 
 	// Группируем результаты по entity_text
 	for _, hit := range hits {
-		// В SQL ответе нет прямого указания на исходный запрос,
-		// поэтому используем name как ключ
 		if _, ok := result[hit.Name]; !ok {
 			result[hit.Name] = make([]domain.GeoHit, 0)
 		}
 		result[hit.Name] = append(result[hit.Name], hit)
 
-		// Сохраняем в кэш
 		if c.cache != nil {
 			c.cache.Set(hit.Name, []domain.GeoHit{hit})
 		}
@@ -221,15 +249,20 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 		strings.Join(conditions, " OR "))
 
 	if c.config.DebugMode {
-		log.Printf("Executing batch query with %d terms", len(texts))
+		// Логируем только первые несколько условий, чтобы не засорять лог
+		if len(texts) > 5 {
+			log.Printf("Query with %d terms: %s ...", len(texts), query[:200])
+		} else {
+			log.Printf("Query: %s", query)
+		}
 	}
 
 	// Выполняем запрос с повторными попытками
 	var resp *Manticoresearch.SqlResponse
 	var err error
+	var httpResp *http.Response
 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		// Проверяем контекст перед каждой попыткой
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -248,7 +281,7 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 		reqCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
 		defer cancel()
 
-		resp, _, err = c.apiClient.UtilsAPI.Sql(reqCtx).
+		resp, httpResp, err = c.apiClient.UtilsAPI.Sql(reqCtx).
 			Body(query).
 			RawResponse(false).
 			Execute()
@@ -257,11 +290,16 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 			break
 		}
 
+		// Логируем детали ошибки
 		if c.config.DebugMode {
 			log.Printf("Query attempt %d failed: %v", attempt+1, err)
+			if httpResp != nil {
+				body, _ := io.ReadAll(httpResp.Body)
+				log.Printf("HTTP Response status: %s, body: %s", httpResp.Status, string(body))
+				httpResp.Body.Close()
+			}
 		}
 
-		// Если ошибка из-за отмены контекста, прекращаем
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -276,9 +314,29 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 
 // escapeString экранирует спецсимволы для Manticore
 func (c *ManticoreClient) escapeString(s string) string {
-	// Экранируем обратную косую черту и кавычки
+	// Manticore требует экранирования следующих символов:
+	// \ ' " = ! ( ) | & ; : / - + * % $ # @ , . ? ~ < > { } [ ] ^
+
+	// Сначала экранируем обратную косую черту
 	s = strings.ReplaceAll(s, `\`, `\\`)
+
+	// Экранируем кавычки
 	s = strings.ReplaceAll(s, `"`, `\"`)
+
+	// Экранируем одинарные кавычки (хотя мы используем двойные, но на всякий случай)
+	s = strings.ReplaceAll(s, `'`, `\'`)
+
+	// Экранируем спецсимволы для regexp, если они есть в запросе
+	// В match мы используем точное совпадение с ^ и $, поэтому нужно экранировать и их
+	s = strings.ReplaceAll(s, `^`, `\^`)
+	s = strings.ReplaceAll(s, `$`, `\$`)
+
+	// Экранируем другие спецсимволы Manticore
+	special := []string{"=", "!", "(", ")", "|", "&", ";", ":", "/", "-", "+", "*", "%", "#", "@", ",", ".", "?", "~", "<", ">", "{", "}", "[", "]"}
+	for _, ch := range special {
+		s = strings.ReplaceAll(s, ch, `\`+ch)
+	}
+
 	return s
 }
 
