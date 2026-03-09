@@ -290,33 +290,44 @@ func (o *Orchestrator) processDocRecords(ctx context.Context, workerID int,
 	}
 
 	if err != nil {
-		// Можно добавить логирование ошибки здесь, если нужно
-		// o.log.Error("Query failed for doc_id %s: %v", docID, err)
+		// Ошибка запроса - все записи этого doc_id идут в skipped
 		o.mu.Lock()
 		o.skipped += int64(len(filteredRecords))
 		o.mu.Unlock()
+
+		// Записываем в skipped файл для каждой записи
+		for _, rec := range filteredRecords {
+			o.writeSkippedFromInfo(rec, nil, "query_error")
+		}
 		return
 	}
 
-	// 4. Агрегируем результаты для этого doc_id
-	result := domain.NewGeoResult(docID)
-	hasGeohashes := false
+	// 4. Разделяем записи на те, что с hits, и те, что без
+	var recordsWithHits []domain.CSVRecord
+	var recordsWithoutHits []domain.CSVRecord
 
 	for _, rec := range filteredRecords {
 		hits := hitsMap[rec.EntityText]
-		info := infoMap[rec.EntityText]
-
 		if len(hits) == 0 {
-			// Не найдено в Manticore
-			o.writeSkippedFromInfo(rec, info, "not_found_in_manticore")
-			continue
+			recordsWithoutHits = append(recordsWithoutHits, rec)
+			o.writeSkippedFromInfo(rec, infoMap[rec.EntityText], "not_found_in_manticore")
+		} else {
+			recordsWithHits = append(recordsWithHits, rec)
 		}
+	}
 
-		// Проверяем, есть ли геохеши
+	// 5. Проверяем, есть ли геохеши среди записей с hits
+	hasGeohashes := false
+	result := domain.NewGeoResult(docID)
+
+	// Для записей с hits проверяем наличие геохешей
+	for _, rec := range recordsWithHits {
+		hits := hitsMap[rec.EntityText]
 		for _, hit := range hits {
 			strs, uints := hit.ToGeoResult()
 			if len(strs) > 0 || len(uints) > 0 {
 				hasGeohashes = true
+				// Добавляем все геохеши в результат
 				for _, s := range strs {
 					result.GeohashesStringMap[s] = struct{}{}
 				}
@@ -327,16 +338,28 @@ func (o *Orchestrator) processDocRecords(ctx context.Context, workerID int,
 		}
 	}
 
-	// 5. Обновляем статистику и отправляем результат
+	// 6. Обновляем статистику в зависимости от наличия геохешей
+	o.mu.Lock()
 	if hasGeohashes {
-		o.mu.Lock()
-		o.processed += int64(len(filteredRecords))
+		// Есть геохеши - записи с hits идут в processed, без hits - в skipped
+		o.processed += int64(len(recordsWithHits))
+		o.skipped += int64(len(recordsWithoutHits))
 		o.mu.Unlock()
-		resultsChan <- result
+
+		// Отправляем результат, только если есть геохеши
+		if len(result.GeohashesStringMap) > 0 || len(result.GeohashesUint64Map) > 0 {
+			resultsChan <- result
+		}
 	} else {
-		o.mu.Lock()
-		o.skipped += int64(len(filteredRecords))
+		// Нет геохешей - все записи идут в skipped
+		o.skipped += int64(len(recordsWithHits) + len(recordsWithoutHits))
 		o.mu.Unlock()
+
+		// Записи с hits (но без геохешей) тоже нужно записать в skipped файл
+		for _, rec := range recordsWithHits {
+			o.writeSkippedFromInfo(rec, infoMap[rec.EntityText], "hit_without_geohashes")
+		}
+		// Записи без hits уже записаны выше
 	}
 }
 
