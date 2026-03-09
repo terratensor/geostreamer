@@ -256,6 +256,22 @@ SELECT * FROM geoname_dict WHERE match('"^entity_text$"')
 | **Rate** | Скорость обработки записей в секунду |
 | **Total processing time** | Общее время выполнения |
 
+
+### Тестовые данные 100к обработанных параграфов
+```
+(venv) audetv@home:~/go/src/github.com/terratensor/geostreamer$ wc -l testdata/test.csv
+833855 testdata/test.csv
+(venv) audetv@home:~/go/src/github.com/terratensor/geostreamer$ tail -n +2 testdata/test.csv | cut -d'|' -f2,3 | cut -d'|' -f1 | sort | uniq -c
+ 244552 LOC
+  85626 ORG
+ 503676 PER
+(venv) audetv@home:~/go/src/github.com/terratensor/geostreamer$ tail -n +2 testdata/test.csv | cut -d'|' -f2,3 | sort -u | cut -d'|' -f1 | sort | uniq -c
+  54567 LOC
+  35652 ORG
+ 156217 PER
+(venv) audetv@home:~/go/src/github.com/terratensor/geostreamer$ 
+```
+
 ### Анализ производительности
 
 Тестирование проводилось на файле, полученном из обработки 100 000 параграфов текстовой базы. Входной CSV файл содержит **833 855 записей** с именованными сущностями.
