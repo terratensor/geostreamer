@@ -373,67 +373,6 @@ func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string, w
 	return hits, info, nil
 }
 
-// executeBatchQuery для внутреннего использования
-func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string, workerID int) ([]domain.GeoHit, error) {
-	if len(texts) == 0 {
-		return nil, nil
-	}
-
-	type queryResult struct {
-		text string
-		hits []domain.GeoHit
-		info *QueryInfo
-		err  error
-	}
-
-	resultChan := make(chan queryResult, len(texts))
-	batchCtx, batchCancel := context.WithTimeout(context.Background(), c.config.Timeout)
-	defer batchCancel()
-
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, c.config.ParallelQueries)
-
-	for _, text := range texts {
-		wg.Add(1)
-		go func(searchText string) {
-			defer wg.Done()
-
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-batchCtx.Done():
-				return
-			}
-
-			hits, _, err := c.executeSingleQuery(batchCtx, searchText, workerID)
-
-			select {
-			case resultChan <- queryResult{
-				text: searchText,
-				hits: hits,
-				err:  err,
-			}:
-			case <-batchCtx.Done():
-			}
-		}(text)
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	var allHits []domain.GeoHit
-	for res := range resultChan {
-		if res.err != nil {
-			continue
-		}
-		allHits = append(allHits, res.hits...)
-	}
-
-	return allHits, nil
-}
-
 // escapeString экранирует спецсимволы для Manticore
 func (c *ManticoreClient) escapeString(s string) string {
 	var builder strings.Builder
