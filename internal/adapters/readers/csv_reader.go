@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -64,8 +65,38 @@ func (r *CSVReader) init() error {
 	}
 	r.file = file
 
+	// Получаем размер файла для валидации
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	// Валидация чекпоинта
+	if cp.Offset > fileInfo.Size() {
+		log.Printf("Warning: checkpoint offset %d exceeds file size %d, resetting to 0",
+			cp.Offset, fileInfo.Size())
+		cp.Offset = 0
+		cp.LineNumber = 0
+	}
+
 	// Если есть сохраненное смещение, переходим на него
 	if cp.Offset > 0 {
+		// Ищем ближайшее начало строки ДО этого смещения
+		correctOffset, err := r.findLineStart(cp.Offset)
+		if err != nil {
+			log.Printf("Warning: error finding line start: %v", err)
+			correctOffset = cp.Offset
+		}
+
+		// Если смещение изменилось, корректируем
+		if correctOffset != cp.Offset {
+			log.Printf("Checkpoint offset corrected: %d -> %d (line number reset)",
+				cp.Offset, correctOffset)
+			cp.Offset = correctOffset
+			cp.LineNumber = 0 // Сбрасываем номер строки, так как не знаем точный
+		}
+
+		// Переходим на скорректированную позицию
 		_, err = r.file.Seek(cp.Offset, io.SeekStart)
 		if err != nil {
 			r.file.Close()
@@ -75,27 +106,209 @@ func (r *CSVReader) init() error {
 		r.currentLine = cp.LineNumber
 	}
 
-	// Создаем CSV reader с буфером
+	// Создаем CSV reader с буфером (всегда создаем новый после seek)
 	r.reader = csv.NewReader(bufio.NewReaderSize(r.file, 1024*1024))
 	r.reader.Comma = r.delimiter
 	r.reader.ReuseRecord = true
 	r.reader.FieldsPerRecord = -1
 	r.reader.TrimLeadingSpace = true
 
+	// Если мы не в начале файла, проверяем позицию
+	if cp.Offset > 0 {
+		// Проверяем, что мы действительно на начале строки
+		if err := r.validatePosition(); err != nil {
+			log.Printf("Warning: position validation failed at offset %d: %v", cp.Offset, err)
+
+			// Если позиция невалидна, пробуем найти следующую валидную строку
+			if err := r.skipToNextLine(); err != nil {
+				log.Printf("Warning: failed to skip to next line: %v", err)
+			} else {
+				// Обновляем offset после пропуска строки
+				r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
+				log.Printf("Advanced to next line at offset %d", r.currentOffset)
+			}
+		} else if r.debugMode {
+			log.Printf("Position %d validated successfully", cp.Offset)
+		}
+	}
+
 	// Пропускаем заголовок, если мы в начале файла
 	if cp.Offset == 0 {
-		if _, err := r.reader.Read(); err != nil {
+		// Пробуем прочитать заголовок
+		header, err := r.reader.Read()
+		if err != nil {
 			r.file.Close()
 			return fmt.Errorf("failed to read header: %w", err)
 		}
-		r.currentLine++
-		r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
+
+		// Проверяем, что это действительно заголовок
+		if len(header) >= 6 {
+			r.currentLine++
+			r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
+			if r.debugMode {
+				log.Printf("Header read successfully: %v", header)
+			}
+		} else {
+			log.Printf("Warning: header may be invalid: %v", header)
+		}
 	}
 
-	fmt.Printf("Starting from line %d (offset: %d)\n", r.currentLine+1, r.currentOffset)
+	log.Printf("Starting from line %d (offset: %d)", r.currentLine+1, r.currentOffset)
 	if r.debugMode {
-		fmt.Println("Debug mode: ON")
+		log.Println("Debug mode: ON")
 	}
+
+	return nil
+}
+
+// findLineStart ищет ближайшее начало строки ДО указанного offset
+func (r *CSVReader) findLineStart(offset int64) (int64, error) {
+	if offset == 0 {
+		return 0, nil
+	}
+
+	// Отступаем немного назад, чтобы найти начало строки
+	lookback := int64(1024) // 1KB
+
+	start := offset - lookback
+	if start < 0 {
+		start = 0
+	}
+
+	// Читаем буфер вокруг проблемной позиции
+	buffer := make([]byte, lookback)
+	n, err := r.file.ReadAt(buffer, start)
+	if err != nil && err != io.EOF {
+		return 0, fmt.Errorf("failed to read buffer at %d: %w", start, err)
+	}
+	buffer = buffer[:n]
+
+	if r.debugMode {
+		log.Printf("Searching for line start near offset %d (lookback %d bytes)", offset, lookback)
+	}
+
+	// Ищем последний символ новой строки в буфере
+	lastNewline := -1
+	for i := len(buffer) - 1; i >= 0; i-- {
+		if buffer[i] == '\n' {
+			lastNewline = i
+			break
+		}
+	}
+
+	// Если нашли новую строку
+	if lastNewline >= 0 {
+		newOffset := start + int64(lastNewline) + 1
+		if r.debugMode && newOffset != offset {
+			log.Printf("Found line start at offset %d (was %d)", newOffset, offset)
+		}
+		return newOffset, nil
+	}
+
+	// Если не нашли, пробуем с большим буфером
+	if lookback < 1024*1024 { // Не больше 1MB
+		return r.findLineStartWithLargerLookback(offset, lookback*2)
+	}
+
+	log.Printf("Warning: could not find line start near %d", offset)
+	return offset, nil
+}
+
+// findLineStartWithLargerLookback пробует найти начало строки с увеличенным буфером
+func (r *CSVReader) findLineStartWithLargerLookback(offset, lookback int64) (int64, error) {
+	start := offset - lookback
+	if start < 0 {
+		start = 0
+	}
+
+	buffer := make([]byte, lookback)
+	n, err := r.file.ReadAt(buffer, start)
+	if err != nil && err != io.EOF {
+		return offset, nil
+	}
+	buffer = buffer[:n]
+
+	// Ищем последний символ новой строки
+	for i := len(buffer) - 1; i >= 0; i-- {
+		if buffer[i] == '\n' {
+			return start + int64(i) + 1, nil
+		}
+	}
+
+	return offset, nil
+}
+
+// validatePosition проверяет, что текущая позиция - начало валидной строки
+func (r *CSVReader) validatePosition() error {
+	// Сохраняем текущую позицию
+	pos, err := r.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	// Пробуем прочитать первую строку
+	tempReader := csv.NewReader(bufio.NewReader(r.file))
+	tempReader.Comma = r.delimiter
+	tempReader.FieldsPerRecord = -1
+	tempReader.TrimLeadingSpace = true
+
+	record, err := tempReader.Read()
+
+	// Возвращаемся на исходную позицию
+	if _, seekErr := r.file.Seek(pos, io.SeekStart); seekErr != nil {
+		return fmt.Errorf("failed to seek back: %w", seekErr)
+	}
+
+	if err != nil {
+		return fmt.Errorf("cannot read at current position: %w", err)
+	}
+
+	// Проверяем, что запись имеет правильный формат
+	if len(record) < 3 {
+		return fmt.Errorf("invalid record format at position %d", pos)
+	}
+
+	if r.debugMode {
+		log.Printf("Position %d validated with record: %v", pos, record)
+	}
+	return nil
+}
+
+// skipToNextLine пропускает текущую строку и переходит к следующей
+func (r *CSVReader) skipToNextLine() error {
+	// Создаем buffered reader для чтения по байтам
+	reader := bufio.NewReader(r.file)
+
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+
+		// Нашли конец строки
+		if b == '\n' {
+			break
+		}
+	}
+
+	// Получаем текущую позицию после прочитанной строки
+	offset, err := r.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	// Обновляем смещение в reader'е
+	r.currentOffset = offset
+
+	// Создаем новый CSV reader с обновленной позицией
+	r.reader = csv.NewReader(bufio.NewReaderSize(r.file, 1024*1024))
+	r.reader.Comma = r.delimiter
+	r.reader.ReuseRecord = true
+	r.reader.FieldsPerRecord = -1
+	r.reader.TrimLeadingSpace = true
 
 	return nil
 }
