@@ -202,10 +202,16 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 		return nil, nil
 	}
 
+	// Проверяем, не отменен ли контекст перед началом
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	// Строим SQL запрос с OR для всех текстов
 	conditions := make([]string, len(texts))
 	for i, text := range texts {
-		// Экранируем кавычки и спецсимволы
 		escaped := c.escapeString(text)
 		conditions[i] = fmt.Sprintf("match('\"^%s$\"')", escaped)
 	}
@@ -214,11 +220,22 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 		c.indexName,
 		strings.Join(conditions, " OR "))
 
+	if c.config.DebugMode {
+		log.Printf("Executing batch query with %d terms", len(texts))
+	}
+
 	// Выполняем запрос с повторными попытками
 	var resp *Manticoresearch.SqlResponse
 	var err error
 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		// Проверяем контекст перед каждой попыткой
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -227,19 +244,26 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 			}
 		}
 
-		// Используем rawResponse=false для получения структурированного ответа
-		resp, _, err = c.apiClient.UtilsAPI.Sql(ctx).
+		// Создаем запрос с таймаутом
+		reqCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+		defer cancel()
+
+		resp, _, err = c.apiClient.UtilsAPI.Sql(reqCtx).
 			Body(query).
-			RawResponse(false). // Получаем структурированный ответ
+			RawResponse(false).
 			Execute()
 
 		if err == nil {
 			break
 		}
 
-		// Логируем ошибку для отладки
 		if c.config.DebugMode {
 			log.Printf("Query attempt %d failed: %v", attempt+1, err)
+		}
+
+		// Если ошибка из-за отмены контекста, прекращаем
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 	}
 
@@ -247,7 +271,6 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 		return nil, fmt.Errorf("query failed after %d attempts: %w", c.config.MaxRetries+1, err)
 	}
 
-	// Парсим ответ
 	return c.parseResponse(resp)
 }
 
