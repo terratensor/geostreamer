@@ -2,6 +2,7 @@ package repositories
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,16 +17,17 @@ import (
 
 // Config конфигурация клиента Manticore
 type Config struct {
-	BaseURL    string        // например "http://localhost:9308"
-	IndexName  string        // например "geoname_dict"
-	Timeout    time.Duration // таймаут запросов
-	MaxRetries int           // количество попыток при ошибке
-	RetryDelay time.Duration // задержка между попытками
-	CacheSize  int           // размер кэша (количество сущностей)
-	CacheTTL   time.Duration // время жизни кэша
-	BatchSize  int           // максимальный размер батча для запроса
-	Workers    int           // количество параллельных воркеров
-	DebugMode  bool          // режим отладки
+	BaseURL         string        // например "http://localhost:9308"
+	IndexName       string        // например "geoname_dict"
+	Timeout         time.Duration // таймаут запросов
+	MaxRetries      int           // количество попыток при ошибке
+	RetryDelay      time.Duration // задержка между попытками
+	CacheSize       int           // размер кэша (количество сущностей)
+	CacheTTL        time.Duration // время жизни кэша
+	BatchSize       int           // максимальный размер батча для запроса
+	Workers         int           // количество параллельных воркеров
+	DebugMode       bool          // режим отладки
+	ParallelQueries int           // количество параллельных запросов в батче // Добавить эту строку
 }
 
 // QueryCache простой кэш для результатов запросов
@@ -191,14 +193,8 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 		return nil, nil
 	}
 
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
+	// НЕ проверяем ctx.Done() здесь - даем шанс выполниться
 
-	// Для HTTP API мы не можем использовать OR с большим количеством условий
-	// Вместо этого делаем отдельные запросы для каждого текста, но параллельно
 	if c.config.DebugMode {
 		log.Printf("Processing %d individual queries for batch", len(texts))
 	}
@@ -212,27 +208,43 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 
 	resultChan := make(chan queryResult, len(texts))
 
-	// Ограничиваем параллелизм на уровне запросов
-	semaphore := make(chan struct{}, 5) // максимум 5 параллельных запросов
+	// Создаем отдельный контекст для этого батча, который НЕ отменяется при внешней отмене
+	// Но имеет таймаут
+	batchCtx, batchCancel := context.WithTimeout(context.Background(), c.config.Timeout)
+	defer batchCancel()
 
 	var wg sync.WaitGroup
+
+	// Ограничиваем параллелизм
+	semaphore := make(chan struct{}, c.config.ParallelQueries)
 
 	for _, text := range texts {
 		wg.Add(1)
 		go func(searchText string) {
 			defer wg.Done()
 
-			// Захватываем семафор
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-batchCtx.Done():
+				resultChan <- queryResult{
+					text: searchText,
+					err:  batchCtx.Err(),
+				}
+				return
+			}
 
-			// Выполняем одиночный запрос
-			hits, err := c.executeSingleQuery(ctx, searchText)
+			// Используем batchCtx для запроса, а не родительский ctx
+			hits, err := c.executeSingleQuery(batchCtx, searchText)
 
-			resultChan <- queryResult{
+			select {
+			case resultChan <- queryResult{
 				text: searchText,
 				hits: hits,
 				err:  err,
+			}:
+			case <-batchCtx.Done():
+				// Контекст отменен, не отправляем результат
 			}
 		}(text)
 	}
@@ -243,19 +255,28 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 		close(resultChan)
 	}()
 
-	// Собираем результаты
+	// Собираем результаты с таймаутом
 	var allHits []domain.GeoHit
-	for result := range resultChan {
-		if result.err != nil {
-			if c.config.DebugMode {
-				log.Printf("Query for '%s' failed: %v", result.text, result.err)
+	for {
+		select {
+		case result, ok := <-resultChan:
+			if !ok {
+				return allHits, nil
 			}
-			continue
+			if result.err != nil {
+				if c.config.DebugMode && !errors.Is(result.err, context.DeadlineExceeded) {
+					log.Printf("Query for '%s' failed: %v", result.text, result.err)
+				}
+				continue
+			}
+			allHits = append(allHits, result.hits...)
+		case <-time.After(c.config.Timeout):
+			// Если долго нет результатов, возвращаем что есть
+			log.Printf("Batch timeout after %v, returning %d results",
+				c.config.Timeout, len(allHits))
+			return allHits, nil
 		}
-		allHits = append(allHits, result.hits...)
 	}
-
-	return allHits, nil
 }
 
 // executeSingleQuery выполняет одиночный запрос к Manticore

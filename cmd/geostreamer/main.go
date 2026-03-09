@@ -39,16 +39,17 @@ func main() {
 
 	// Создаем Manticore клиент
 	manticoreCfg := repositories.Config{
-		BaseURL:    cfg.Manticore.BaseURL,
-		IndexName:  cfg.Manticore.IndexName,
-		Timeout:    cfg.Manticore.Timeout,
-		MaxRetries: cfg.Manticore.MaxRetries,
-		RetryDelay: cfg.Manticore.RetryDelay,
-		CacheSize:  cfg.Manticore.CacheSize,
-		CacheTTL:   cfg.Manticore.CacheTTL,
-		BatchSize:  cfg.Manticore.BatchSize,
-		Workers:    cfg.Manticore.Workers,
-		DebugMode:  cfg.Manticore.DebugMode,
+		BaseURL:         cfg.Manticore.BaseURL,
+		IndexName:       cfg.Manticore.IndexName,
+		Timeout:         cfg.Manticore.Timeout,
+		MaxRetries:      cfg.Manticore.MaxRetries,
+		RetryDelay:      cfg.Manticore.RetryDelay,
+		CacheSize:       cfg.Manticore.CacheSize,
+		CacheTTL:        cfg.Manticore.CacheTTL,
+		BatchSize:       cfg.Manticore.BatchSize,
+		Workers:         cfg.Manticore.Workers,
+		DebugMode:       cfg.Manticore.DebugMode,
+		ParallelQueries: cfg.Manticore.ParallelQueries,
 	}
 
 	repo, err := repositories.NewManticoreClient(manticoreCfg)
