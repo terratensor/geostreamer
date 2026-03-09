@@ -17,17 +17,18 @@ type Config struct {
 	}
 
 	Manticore struct {
-		BaseURL      string
-		IndexName    string
-		Timeout      time.Duration
-		MaxRetries   int
-		RetryDelay   time.Duration
-		CacheSize    int
-		CacheTTL     time.Duration
-		BatchSize    int
-		Workers      int
-		DebugMode    bool
-		MaxBatchSize int
+		BaseURL         string
+		IndexName       string
+		Timeout         time.Duration
+		MaxRetries      int
+		RetryDelay      time.Duration
+		CacheSize       int
+		CacheTTL        time.Duration
+		BatchSize       int
+		Workers         int
+		DebugMode       bool
+		MaxBatchSize    int
+		ParallelQueries int
 	}
 
 	Output struct {
@@ -63,6 +64,7 @@ func Load() *Config {
 	flag.IntVar(&cfg.Manticore.Workers, "manticore-workers", 10, "Number of parallel Manticore workers")
 	flag.BoolVar(&cfg.Manticore.DebugMode, "manticore-debug", false, "Manticore client debug mode")
 	flag.IntVar(&cfg.Manticore.MaxBatchSize, "manticore-max-batch", 50, "Maximum batch size for single query")
+	flag.IntVar(&cfg.Manticore.ParallelQueries, "manticore-parallel", 5, "Number of parallel queries per batch")
 
 	// Output flags
 	flag.StringVar(&cfg.Output.Path, "output", "results.ndjson", "Path to output NDJSON file")
