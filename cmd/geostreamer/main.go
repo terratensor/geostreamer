@@ -32,10 +32,12 @@ func main() {
 
 	// Создаем CSV reader
 	delimRune := []rune(cfg.CSV.Delimiter)[0]
+	// Создаем CSV reader с новыми параметрами
 	source, err := readers.NewCSVReader(
 		cfg.CSV.Path,
 		delimRune,
-		cfg.CSV.BatchSize,
+		cfg.CSV.BatchSize,    // максимальный размер батча (500-800)
+		cfg.CSV.MinBatchSize, // минимальный размер (100)
 		cfg.CSV.CheckpointPath,
 		cfg.CSV.StrictMode,
 		cfg.CSV.DebugMode,

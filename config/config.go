@@ -8,10 +8,12 @@ import (
 
 // Config общая конфигурация приложения
 type Config struct {
+	// CSV struct в Config
 	CSV struct {
 		Path           string
 		Delimiter      string
-		BatchSize      int
+		BatchSize      int // максимальное количество записей в батче
+		MinBatchSize   int // минимальное количество записей для отправки
 		CheckpointPath string
 		StrictMode     bool
 		DebugMode      bool
@@ -59,6 +61,7 @@ func Load() *Config {
 	// CSV flags
 	flag.StringVar(&cfg.CSV.Path, "csv", "data.csv", "path to CSV file")
 	flag.StringVar(&cfg.CSV.Delimiter, "delim", "|", "CSV delimiter")
+	flag.IntVar(&cfg.CSV.MinBatchSize, "csv-min-batch", 100, "Minimum records to trigger batch send")
 	flag.IntVar(&cfg.CSV.BatchSize, "csv-batch", 10000, "CSV read batch size")
 	flag.StringVar(&cfg.CSV.CheckpointPath, "checkpoint", "geostreamer.checkpoint", "path to checkpoint file")
 	flag.BoolVar(&cfg.CSV.StrictMode, "strict", false, "strict mode - stop on any error")

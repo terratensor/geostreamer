@@ -20,7 +20,8 @@ import (
 type CSVReader struct {
 	filePath      string
 	delimiter     rune
-	batchSize     int
+	maxBatchSize  int // максимальное количество записей в батче
+	minBatchSize  int // минимальное количество записей для отправки
 	checkpointMgr *checkpoint.Manager
 	file          *os.File
 	reader        *csv.Reader
@@ -28,15 +29,18 @@ type CSVReader struct {
 	currentOffset int64
 	skippedLines  int64
 	strictMode    bool
-	debugMode     bool // новый флаг для отладки
+	debugMode     bool
 }
 
 // NewCSVReader создает новый CSVReader
-func NewCSVReader(filePath string, delimiter rune, batchSize int, checkpointPath string, strictMode, debugMode bool) (*CSVReader, error) {
+func NewCSVReader(filePath string, delimiter rune, maxBatchSize, minBatchSize int,
+	checkpointPath string, strictMode, debugMode bool) (*CSVReader, error) {
+
 	reader := &CSVReader{
 		filePath:      filePath,
 		delimiter:     delimiter,
-		batchSize:     batchSize,
+		maxBatchSize:  maxBatchSize,
+		minBatchSize:  minBatchSize,
 		checkpointMgr: checkpoint.NewManager(checkpointPath),
 		strictMode:    strictMode,
 		debugMode:     debugMode,
@@ -93,7 +97,7 @@ func (r *CSVReader) init() error {
 			log.Printf("Checkpoint offset corrected: %d -> %d (line number reset)",
 				cp.Offset, correctOffset)
 			cp.Offset = correctOffset
-			cp.LineNumber = 0 // Сбрасываем номер строки, так как не знаем точный
+			cp.LineNumber = 0
 		}
 
 		// Переходим на скорректированную позицию
@@ -106,7 +110,7 @@ func (r *CSVReader) init() error {
 		r.currentLine = cp.LineNumber
 	}
 
-	// Создаем CSV reader с буфером (всегда создаем новый после seek)
+	// Создаем CSV reader с буфером
 	r.reader = csv.NewReader(bufio.NewReaderSize(r.file, 1024*1024))
 	r.reader.Comma = r.delimiter
 	r.reader.ReuseRecord = true
@@ -115,42 +119,19 @@ func (r *CSVReader) init() error {
 
 	// Если мы не в начале файла, проверяем позицию
 	if cp.Offset > 0 {
-		// Проверяем, что мы действительно на начале строки
 		if err := r.validatePosition(); err != nil {
 			log.Printf("Warning: position validation failed at offset %d: %v", cp.Offset, err)
-
-			// Если позиция невалидна, пробуем найти следующую валидную строку
-			if err := r.skipToNextLine(); err != nil {
-				log.Printf("Warning: failed to skip to next line: %v", err)
-			} else {
-				// Обновляем offset после пропуска строки
-				r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
-				log.Printf("Advanced to next line at offset %d", r.currentOffset)
-			}
-		} else if r.debugMode {
-			log.Printf("Position %d validated successfully", cp.Offset)
 		}
 	}
 
 	// Пропускаем заголовок, если мы в начале файла
 	if cp.Offset == 0 {
-		// Пробуем прочитать заголовок
-		header, err := r.reader.Read()
-		if err != nil {
+		if _, err := r.reader.Read(); err != nil {
 			r.file.Close()
 			return fmt.Errorf("failed to read header: %w", err)
 		}
-
-		// Проверяем, что это действительно заголовок
-		if len(header) >= 6 {
-			r.currentLine++
-			r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
-			if r.debugMode {
-				log.Printf("Header read successfully: %v", header)
-			}
-		} else {
-			log.Printf("Warning: header may be invalid: %v", header)
-		}
+		r.currentLine++
+		r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
 	}
 
 	log.Printf("Starting from line %d (offset: %d)", r.currentLine+1, r.currentOffset)
@@ -161,174 +142,104 @@ func (r *CSVReader) init() error {
 	return nil
 }
 
-// findLineStart ищет ближайшее начало строки ДО указанного offset
-func (r *CSVReader) findLineStart(offset int64) (int64, error) {
-	if offset == 0 {
-		return 0, nil
-	}
+// ReadRecords читает записи и отправляет их батчами в канал
+func (r *CSVReader) ReadRecords(ctx context.Context) (<-chan []domain.CSVRecord, <-chan error) {
+	batchChan := make(chan []domain.CSVRecord, 10) // буфер для батчей
+	errChan := make(chan error, 1)
 
-	// Отступаем немного назад, чтобы найти начало строки
-	lookback := int64(1024) // 1KB
+	go func() {
+		defer close(batchChan)
+		defer close(errChan)
 
-	start := offset - lookback
-	if start < 0 {
-		start = 0
-	}
+		var currentBatch []domain.CSVRecord
+		var currentDocID string
+		batchSize := 0
 
-	// Читаем буфер вокруг проблемной позиции
-	buffer := make([]byte, lookback)
-	n, err := r.file.ReadAt(buffer, start)
-	if err != nil && err != io.EOF {
-		return 0, fmt.Errorf("failed to read buffer at %d: %w", start, err)
-	}
-	buffer = buffer[:n]
+		for {
+			select {
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			default:
+				// Читаем следующую запись
+				record, err := r.readNextRecord()
+				if err == io.EOF {
+					// Отправляем последний батч, если он не пустой
+					if len(currentBatch) > 0 {
+						batchChan <- currentBatch
+					}
 
-	if r.debugMode {
-		log.Printf("Searching for line start near offset %d (lookback %d bytes)", offset, lookback)
-	}
+					// Сохраняем финальный чекпоинт
+					if err := r.saveCheckpoint(); err != nil {
+						errChan <- fmt.Errorf("failed to save final checkpoint: %w", err)
+					}
 
-	// Ищем последний символ новой строки в буфере
-	lastNewline := -1
-	for i := len(buffer) - 1; i >= 0; i-- {
-		if buffer[i] == '\n' {
-			lastNewline = i
-			break
-		}
-	}
+					log.Printf("Finished processing. Total records: %d, Skipped lines: %d\n",
+						r.currentLine, r.skippedLines)
+					return
+				}
 
-	// Если нашли новую строку
-	if lastNewline >= 0 {
-		newOffset := start + int64(lastNewline) + 1
-		if r.debugMode && newOffset != offset {
-			log.Printf("Found line start at offset %d (was %d)", newOffset, offset)
-		}
-		return newOffset, nil
-	}
+				// Обрабатываем ошибки чтения
+				if err != nil {
+					r.debugDumpLine(r.currentLine+1, err)
+					if r.isCriticalError(err) {
+						errChan <- fmt.Errorf("critical error at line %d: %w", r.currentLine+1, err)
+						return
+					}
+					r.skippedLines++
+					log.Printf("Warning: skipped line %d: %v", r.currentLine+1, err)
+					continue
+				}
 
-	// Если не нашли, пробуем с большим буфером
-	if lookback < 1024*1024 { // Не больше 1MB
-		return r.findLineStartWithLargerLookback(offset, lookback*2)
-	}
+				// Проверяем смену doc_id
+				if record.DocID != currentDocID && len(currentBatch) > 0 {
+					// Отправляем батч, если набрали минимум ИЛИ принудительно по смене doc_id
+					if batchSize >= r.minBatchSize {
+						batchChan <- currentBatch
+						currentBatch = nil
+						batchSize = 0
+					} else {
+						// Если мало записей, но сменился doc_id - все равно отправляем,
+						// чтобы не копить слишком долго
+						batchChan <- currentBatch
+						currentBatch = nil
+						batchSize = 0
+					}
+				}
 
-	log.Printf("Warning: could not find line start near %d", offset)
-	return offset, nil
-}
+				// Добавляем запись в текущий батч
+				currentDocID = record.DocID
+				currentBatch = append(currentBatch, record)
+				batchSize++
 
-// findLineStartWithLargerLookback пробует найти начало строки с увеличенным буфером
-func (r *CSVReader) findLineStartWithLargerLookback(offset, lookback int64) (int64, error) {
-	start := offset - lookback
-	if start < 0 {
-		start = 0
-	}
-
-	buffer := make([]byte, lookback)
-	n, err := r.file.ReadAt(buffer, start)
-	if err != nil && err != io.EOF {
-		return offset, nil
-	}
-	buffer = buffer[:n]
-
-	// Ищем последний символ новой строки
-	for i := len(buffer) - 1; i >= 0; i-- {
-		if buffer[i] == '\n' {
-			return start + int64(i) + 1, nil
-		}
-	}
-
-	return offset, nil
-}
-
-// validatePosition проверяет, что текущая позиция - начало валидной строки
-func (r *CSVReader) validatePosition() error {
-	// Сохраняем текущую позицию
-	pos, err := r.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-
-	// Пробуем прочитать первую строку
-	tempReader := csv.NewReader(bufio.NewReader(r.file))
-	tempReader.Comma = r.delimiter
-	tempReader.FieldsPerRecord = -1
-	tempReader.TrimLeadingSpace = true
-
-	record, err := tempReader.Read()
-
-	// Возвращаемся на исходную позицию
-	if _, seekErr := r.file.Seek(pos, io.SeekStart); seekErr != nil {
-		return fmt.Errorf("failed to seek back: %w", seekErr)
-	}
-
-	if err != nil {
-		return fmt.Errorf("cannot read at current position: %w", err)
-	}
-
-	// Проверяем, что запись имеет правильный формат
-	if len(record) < 3 {
-		return fmt.Errorf("invalid record format at position %d", pos)
-	}
-
-	if r.debugMode {
-		log.Printf("Position %d validated with record: %v", pos, record)
-	}
-	return nil
-}
-
-// skipToNextLine пропускает текущую строку и переходит к следующей
-func (r *CSVReader) skipToNextLine() error {
-	// Создаем buffered reader для чтения по байтам
-	reader := bufio.NewReader(r.file)
-
-	for {
-		b, err := reader.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				return nil
+				// Проверяем, не превысили ли максимальный размер батча
+				if batchSize >= r.maxBatchSize {
+					// Достигли лимита - отправляем, даже если doc_id не закончился
+					// (но таких документов мало, макс 58 записей)
+					batchChan <- currentBatch
+					currentBatch = nil
+					batchSize = 0
+				}
 			}
-			return err
 		}
+	}()
 
-		// Нашли конец строки
-		if b == '\n' {
-			break
-		}
-	}
-
-	// Получаем текущую позицию после прочитанной строки
-	offset, err := r.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-
-	// Обновляем смещение в reader'е
-	r.currentOffset = offset
-
-	// Создаем новый CSV reader с обновленной позицией
-	r.reader = csv.NewReader(bufio.NewReaderSize(r.file, 1024*1024))
-	r.reader.Comma = r.delimiter
-	r.reader.ReuseRecord = true
-	r.reader.FieldsPerRecord = -1
-	r.reader.TrimLeadingSpace = true
-
-	return nil
+	return batchChan, errChan
 }
 
 // readRawLine читает сырую строку из файла для отладки
 func (r *CSVReader) readRawLine() (string, error) {
-	// Сохраняем текущую позицию
 	pos, err := r.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return "", err
 	}
 
-	// Читаем строку через bufio.Reader
 	reader := bufio.NewReader(r.file)
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return "", err
 	}
 
-	// Возвращаемся обратно
 	_, err = r.file.Seek(pos, io.SeekStart)
 	return line, err
 }
@@ -342,19 +253,16 @@ func (r *CSVReader) debugDumpLine(lineNum int64, err error) {
 	fmt.Printf("\n--- DEBUG: Problem at line %d ---\n", lineNum)
 	fmt.Printf("Error: %v\n", err)
 
-	// Пытаемся прочитать сырую строку
 	rawLine, readErr := r.readRawLine()
 	if readErr != nil {
 		fmt.Printf("Failed to read raw line: %v\n", readErr)
 		return
 	}
 
-	// Показываем сырую строку в разных представлениях
 	fmt.Printf("Raw line length: %d bytes\n", len(rawLine))
 	fmt.Printf("Raw line as string: %q\n", rawLine)
 	fmt.Printf("Raw line as hex: %s\n", hex.Dump([]byte(rawLine)))
 
-	// Показываем символы по одному
 	fmt.Println("Characters:")
 	for i, ch := range rawLine {
 		if ch == '\n' {
@@ -372,83 +280,6 @@ func (r *CSVReader) debugDumpLine(lineNum int64, err error) {
 	fmt.Println("--- END DEBUG ---")
 }
 
-// ReadRecords читает записи и отправляет их в канал
-func (r *CSVReader) ReadRecords(ctx context.Context) (<-chan domain.CSVRecord, <-chan error) {
-	recordsChan := make(chan domain.CSVRecord, r.batchSize)
-	errChan := make(chan error, 1)
-
-	go func() {
-		defer close(recordsChan)
-		defer close(errChan)
-
-		batch := make([]domain.CSVRecord, 0, r.batchSize)
-
-		for {
-			select {
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			default:
-				// Запоминаем номер строки перед чтением
-				currentLineNum := r.currentLine + 1
-
-				// Пытаемся прочитать следующую запись
-				record, err := r.readNextRecord()
-				if err == io.EOF {
-					if len(batch) > 0 {
-						r.sendBatch(ctx, batch, recordsChan)
-					}
-
-					if err := r.saveCheckpoint(); err != nil {
-						errChan <- fmt.Errorf("failed to save final checkpoint: %w", err)
-					}
-
-					fmt.Printf("Finished processing. Total records: %d, Skipped lines: %d\n",
-						r.currentLine, r.skippedLines)
-					return
-				}
-
-				// Обрабатываем ошибки чтения
-				if err != nil {
-					// Детальный вывод для отладки
-					r.debugDumpLine(currentLineNum, err)
-
-					if r.isCriticalError(err) {
-						errChan <- fmt.Errorf("critical error at line %d: %w", currentLineNum, err)
-						return
-					}
-
-					r.skippedLines++
-					fmt.Printf("Warning: skipped line %d: %v\n", currentLineNum, err)
-					continue
-				}
-
-				batch = append(batch, record)
-
-				if len(batch) >= r.batchSize {
-					if !r.sendBatch(ctx, batch, recordsChan) {
-						return
-					}
-
-					if err := r.saveCheckpoint(); err != nil {
-						errChan <- fmt.Errorf("failed to save checkpoint: %w", err)
-						return
-					}
-
-					batch = batch[:0]
-
-					if r.currentLine%10000 == 0 {
-						fmt.Printf("Processed %d records, skipped %d lines...\n",
-							r.currentLine, r.skippedLines)
-					}
-				}
-			}
-		}
-	}()
-
-	return recordsChan, errChan
-}
-
 // isCriticalError определяет, является ли ошибка критической
 func (r *CSVReader) isCriticalError(err error) bool {
 	if r.strictMode {
@@ -456,7 +287,6 @@ func (r *CSVReader) isCriticalError(err error) bool {
 	}
 
 	errStr := err.Error()
-	// Пропускаем только известные ошибки парсинга CSV
 	nonCritical := strings.Contains(errStr, "wrong number of fields") ||
 		strings.Contains(errStr, "bare quote") ||
 		strings.Contains(errStr, "invalid record length") ||
@@ -485,7 +315,6 @@ func (r *CSVReader) parseRecord(record []string) (domain.CSVRecord, error) {
 			len(record), record)
 	}
 
-	// Очищаем поля от кавычек и пробелов
 	cleaned := make([]string, len(record))
 	for i, field := range record {
 		cleaned[i] = strings.Trim(field, "\" ")
@@ -520,18 +349,6 @@ func (r *CSVReader) parseRecord(record []string) (domain.CSVRecord, error) {
 	}, nil
 }
 
-// sendBatch отправляет батч записей в канал
-func (r *CSVReader) sendBatch(ctx context.Context, batch []domain.CSVRecord, recordsChan chan<- domain.CSVRecord) bool {
-	for _, record := range batch {
-		select {
-		case <-ctx.Done():
-			return false
-		case recordsChan <- record:
-		}
-	}
-	return true
-}
-
 // saveCheckpoint сохраняет текущий прогресс
 func (r *CSVReader) saveCheckpoint() error {
 	return r.checkpointMgr.Save(r.currentOffset, r.currentLine)
@@ -552,5 +369,95 @@ func (r *CSVReader) Close() error {
 	if r.file != nil {
 		return r.file.Close()
 	}
+	return nil
+}
+
+// findLineStart ищет ближайшее начало строки ДО указанного offset
+func (r *CSVReader) findLineStart(offset int64) (int64, error) {
+	if offset == 0 {
+		return 0, nil
+	}
+
+	lookback := int64(1024)
+	start := offset - lookback
+	if start < 0 {
+		start = 0
+	}
+
+	buffer := make([]byte, lookback)
+	n, err := r.file.ReadAt(buffer, start)
+	if err != nil && err != io.EOF {
+		return 0, fmt.Errorf("failed to read buffer at %d: %w", start, err)
+	}
+	buffer = buffer[:n]
+
+	lastNewline := -1
+	for i := len(buffer) - 1; i >= 0; i-- {
+		if buffer[i] == '\n' {
+			lastNewline = i
+			break
+		}
+	}
+
+	if lastNewline >= 0 {
+		return start + int64(lastNewline) + 1, nil
+	}
+
+	if lookback < 1024*1024 {
+		return r.findLineStartWithLargerLookback(offset, lookback*2)
+	}
+
+	return offset, nil
+}
+
+// findLineStartWithLargerLookback пробует найти начало строки с увеличенным буфером
+func (r *CSVReader) findLineStartWithLargerLookback(offset, lookback int64) (int64, error) {
+	start := offset - lookback
+	if start < 0 {
+		start = 0
+	}
+
+	buffer := make([]byte, lookback)
+	n, err := r.file.ReadAt(buffer, start)
+	if err != nil && err != io.EOF {
+		return offset, nil
+	}
+	buffer = buffer[:n]
+
+	for i := len(buffer) - 1; i >= 0; i-- {
+		if buffer[i] == '\n' {
+			return start + int64(i) + 1, nil
+		}
+	}
+
+	return offset, nil
+}
+
+// validatePosition проверяет, что текущая позиция - начало валидной строки
+func (r *CSVReader) validatePosition() error {
+	pos, err := r.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	tempReader := csv.NewReader(bufio.NewReader(r.file))
+	tempReader.Comma = r.delimiter
+	tempReader.FieldsPerRecord = -1
+	tempReader.TrimLeadingSpace = true
+
+	record, err := tempReader.Read()
+
+	if _, seekErr := r.file.Seek(pos, io.SeekStart); seekErr != nil {
+		return fmt.Errorf("failed to seek back: %w", seekErr)
+	}
+
+	if err != nil {
+		return fmt.Errorf("cannot read at current position: %w", err)
+	}
+
+	if len(record) < 3 {
+		return fmt.Errorf("invalid record format at position %d", pos)
+	}
+
 	return nil
 }
