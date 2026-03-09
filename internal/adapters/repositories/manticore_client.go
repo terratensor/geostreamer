@@ -12,6 +12,7 @@ import (
 	"time"
 
 	Manticoresearch "github.com/manticoresoftware/manticoresearch-go"
+	"github.com/terratensor/geostreamer/internal/adapters/writers"
 	"github.com/terratensor/geostreamer/internal/core/domain"
 )
 
@@ -87,16 +88,34 @@ func (c *QueryCache) Delete(key string) {
 	delete(c.items, key)
 }
 
-// ManticoreClient реализует интерфейс GeonameRepository
+// FailedQueryInfo содержит детали о неудачном запросе
+type FailedQueryInfo struct {
+	Text       string
+	Query      string
+	Error      error
+	HTTPStatus string
+	HTTPBody   string
+	Attempts   int
+	WorkerID   int
+}
+
+// ManticoreClient с поддержкой сбора ошибок
 type ManticoreClient struct {
 	apiClient    *Manticoresearch.APIClient
 	indexName    string
 	config       Config
 	cache        *QueryCache
 	requestPool  *sync.Pool
-	successCount int64        // Добавить
-	failureCount int64        // Добавить
-	mu           sync.RWMutex // Добавить
+	successCount int64
+	failureCount int64
+	failures     []FailedQueryInfo // для сбора деталей
+	mu           sync.RWMutex
+	debugWriter  *writers.DebugWriter // опционально
+}
+
+// SetDebugWriter устанавливает writer для отладки
+func (c *ManticoreClient) SetDebugWriter(w *writers.DebugWriter) {
+	c.debugWriter = w
 }
 
 // NewManticoreClient создает новый клиент Manticore
@@ -282,23 +301,24 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 	}
 }
 
-// executeSingleQuery выполняет одиночный запрос к Manticore
-func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string) ([]domain.GeoHit, error) {
-	// Экранируем спецсимволы
+// executeSingleQuery с детальным логированием ошибок
+func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string, workerID int) ([]domain.GeoHit, error) {
 	escaped := c.escapeString(text)
-
-	// Формируем запрос с точным совпадением
-	query := fmt.Sprintf("SELECT * FROM %s WHERE match('\"^%s$\"')",
-		c.indexName, escaped)
+	query := fmt.Sprintf("SELECT * FROM %s WHERE match('\"^%s$\"')", c.indexName, escaped)
 
 	if c.config.DebugMode {
 		log.Printf("Single query for '%s': %s", text, query)
 	}
 
-	// Выполняем запрос с повторными попытками
+	queryCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
+	defer cancel()
+
 	var resp *Manticoresearch.SqlResponse
 	var err error
 	var httpResp *http.Response
+	var lastErr error
+	var lastHTTPStatus string
+	var lastHTTPBody string
 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
 		select {
@@ -315,10 +335,7 @@ func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string) (
 			}
 		}
 
-		reqCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
-		defer cancel()
-
-		resp, httpResp, err = c.apiClient.UtilsAPI.Sql(reqCtx).
+		resp, httpResp, err = c.apiClient.UtilsAPI.Sql(queryCtx).
 			Body(query).
 			RawResponse(false).
 			Execute()
@@ -330,31 +347,61 @@ func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string) (
 			break
 		}
 
+		lastErr = err
+		if httpResp != nil {
+			lastHTTPStatus = httpResp.Status
+			body, _ := io.ReadAll(httpResp.Body)
+			lastHTTPBody = string(body)
+			httpResp.Body.Close()
+		}
+
 		if attempt == c.config.MaxRetries {
 			c.mu.Lock()
 			c.failureCount++
-			c.mu.Unlock()
-		}
 
-		if c.config.DebugMode && attempt == c.config.MaxRetries {
-			log.Printf("Query failed for '%s': %v", text, err)
-			if httpResp != nil {
-				body, _ := io.ReadAll(httpResp.Body)
-				log.Printf("HTTP Status: %s, Body: %s", httpResp.Status, string(body))
-				httpResp.Body.Close()
+			// Сохраняем детали ошибки
+			failure := FailedQueryInfo{
+				Text:       text,
+				Query:      query,
+				Error:      lastErr,
+				HTTPStatus: lastHTTPStatus,
+				HTTPBody:   lastHTTPBody,
+				Attempts:   attempt + 1,
+				WorkerID:   workerID,
 			}
-		}
+			c.failures = append(c.failures, failure)
 
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			// Если есть debugWriter, записываем туда
+			if c.debugWriter != nil {
+				failedRecord := &domain.FailedRecord{
+					Timestamp:  time.Now(),
+					Query:      query,
+					Error:      lastErr.Error(),
+					Attempts:   attempt + 1,
+					HTTPStatus: lastHTTPStatus,
+					HTTPBody:   lastHTTPBody,
+					WorkerID:   workerID,
+				}
+				// CSVRecord будет заполнен позже в оркестраторе
+				c.debugWriter.WriteFailed(failedRecord)
+			}
+			c.mu.Unlock()
 		}
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("query failed for '%s': %w", text, err)
+		return nil, fmt.Errorf("query failed for '%s' after %d attempts: %w",
+			text, c.config.MaxRetries+1, lastErr)
 	}
 
 	return c.parseResponse(resp)
+}
+
+// GetFailures возвращает детали всех ошибок
+func (c *ManticoreClient) GetFailures() []FailedQueryInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]FailedQueryInfo{}, c.failures...)
 }
 
 // Добавить метод для получения статистики

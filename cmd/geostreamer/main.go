@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"os/signal"
 	"syscall"
 
@@ -20,11 +19,12 @@ func main() {
 
 	// Инициализируем логгер
 	if err := logger.Init(cfg.Logging.Level, cfg.Logging.OutputFile); err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
+		logger.Get().Error("Failed to initialize logger: %v", err)
+		return
 	}
 	log := logger.Get()
 
-	// Создаем контекст с отменой для graceful shutdown
+	// Создаем контекст с отменой
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	defer cancel()
@@ -44,6 +44,14 @@ func main() {
 		return
 	}
 	defer source.Close()
+
+	// Создаем DebugWriter для ошибок и пропусков
+	debugWriter, err := writers.NewDebugWriter(cfg.Output.FailuresPath, cfg.Output.SkippedPath)
+	if err != nil {
+		log.Error("Failed to create debug writer: %v", err)
+		return
+	}
+	defer debugWriter.Close()
 
 	// Создаем Manticore клиент
 	manticoreCfg := repositories.Config{
@@ -67,6 +75,11 @@ func main() {
 	}
 	defer repo.Close()
 
+	// Передаем debugWriter в Manticore клиент если он поддерживает
+	if repoWithDebug, ok := repo.(interface{ SetDebugWriter(*writers.DebugWriter) }); ok {
+		repoWithDebug.SetDebugWriter(debugWriter)
+	}
+
 	// Создаем NDJSON writer
 	writerCfg := writers.NDJSONWriterConfig{
 		FilePath:      cfg.Output.Path,
@@ -87,14 +100,20 @@ func main() {
 		source,
 		repo,
 		writer,
+		debugWriter,
 		cfg.Manticore.Workers,
 		cfg.Manticore.BatchSize,
-		10, // flush after 10 doc_ids
+		10, // flush after 1000 doc_ids
 		cfg.Logging.StatsInterval,
+		cfg.Filter.EntityTypes,
 	)
 
 	// Запускаем обработку
+	log.Info("Starting with filters: %v", cfg.Filter.EntityTypes)
 	if err := orch.Process(ctx); err != nil && err != context.Canceled {
 		log.Error("Processing failed: %v", err)
 	}
+
+	// Финальный сброс debugWriter
+	debugWriter.Flush()
 }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"flag"
+	"strings"
 	"time"
 )
 
@@ -36,12 +37,18 @@ type Config struct {
 		BufferSize    int
 		UseGzip       bool
 		PrettyPrint   bool
+		FailuresPath  string // файл для ошибок
+		SkippedPath   string // файл для пропущенных
+	}
+
+	Filter struct {
+		EntityTypes []string // типы сущностей для обработки, например ["LOC", "PER", "ORG"]
 	}
 
 	Logging struct {
-		Level         string        // "debug", "info", "warn", "error"
-		OutputFile    string        // если пусто - в stdout
-		StatsInterval time.Duration // интервал вывода статистики
+		Level         string
+		OutputFile    string
+		StatsInterval time.Duration
 	}
 }
 
@@ -82,7 +89,22 @@ func Load() *Config {
 	flag.StringVar(&cfg.Logging.OutputFile, "log-file", "", "Log file path (empty for stdout)")
 	flag.DurationVar(&cfg.Logging.StatsInterval, "log-stats", 10*time.Second, "Statistics output interval")
 
+	// Filter flags
+	entityTypes := flag.String("filter-types", "LOC", "Comma-separated entity types to process (e.g., 'LOC,PER,ORG')")
+
+	// Output flags for debugging
+	flag.StringVar(&cfg.Output.FailuresPath, "output-failures", "failures.ndjson", "Path to save failed queries")
+	flag.StringVar(&cfg.Output.SkippedPath, "output-skipped", "skipped.ndjson", "Path to save skipped records")
+
 	flag.Parse()
+
+	// Parse entity types
+	if *entityTypes != "" {
+		cfg.Filter.EntityTypes = strings.Split(*entityTypes, ",")
+		for i, t := range cfg.Filter.EntityTypes {
+			cfg.Filter.EntityTypes[i] = strings.TrimSpace(t)
+		}
+	}
 
 	return &cfg
 }
