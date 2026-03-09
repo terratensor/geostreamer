@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -72,10 +73,10 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 	o.log.Info("Starting processing...")
 	o.startTime = time.Now()
 
-	recordsChan, errChan := o.source.ReadRecords(ctx)
-
 	// Запускаем горутину для вывода статистики
 	go o.statsReporter(ctx)
+
+	recordsChan, errChan := o.source.ReadRecords(ctx)
 
 	// Создаем дочерний контекст для воркеров
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -101,31 +102,24 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 	// Аккумулируем и записываем результаты
 	resultErr := o.processResults(ctx, resultsChan)
 
-	// Ждем завершения воркеров или сигнала отмены
-	select {
-	case <-done:
-		o.log.Info("All workers completed")
-	case <-ctx.Done():
-		o.log.Warn("Context canceled, waiting for workers to finish...")
-		select {
-		case <-done:
-			o.log.Info("Workers finished gracefully")
-		case <-time.After(5 * time.Second):
-			o.log.Warn("Workers did not finish in time, forcing shutdown")
-		}
-	}
+	// Ждем завершения воркеров
+	<-done
+	o.log.Info("All workers completed")
+
+	// ОСТАНАВЛИВАЕМ ТАЙМЕР СТАТИСТИКИ
+	o.statsTicker.Stop()
 
 	// Проверяем ошибки
 	select {
 	case err := <-errChan:
-		if err != nil && err != context.Canceled {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("error from source: %w", err)
 		}
 	default:
 	}
 
 	// Финальный сброс всех результатов
-	if err := o.flushAllResults(ctx); err != nil && err != context.Canceled {
+	if err := o.flushAllResults(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("failed to flush final results: %w", err)
 	}
 
@@ -135,19 +129,16 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 	return resultErr
 }
 
-// statsReporter периодически выводит статистику и сбрасывает буферы
+// statsReporter периодически выводит статистику
 func (o *Orchestrator) statsReporter(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			o.statsTicker.Stop()
+			o.log.Debug("Stats reporter stopped")
 			return
 		case <-o.statsTicker.C:
 			o.printStats()
-			// Сбрасываем буферы debugWriter
-			if o.debugWriter != nil {
-				o.debugWriter.Flush()
-			}
 		}
 	}
 }
@@ -247,14 +238,17 @@ func (o *Orchestrator) processResults(ctx context.Context, resultsChan <-chan *d
 	for {
 		select {
 		case <-ctx.Done():
+			fmt.Println(">>> DEBUG: processResults received ctx.Done()")
 			return ctx.Err()
 		case result, ok := <-resultsChan:
 			if !ok {
+				fmt.Println(">>> DEBUG: resultsChan closed, processing final batch")
 				if len(batch) > 0 {
 					if err := o.writer.WriteBatch(ctx, batch); err != nil {
 						return err
 					}
 				}
+				fmt.Println(">>> DEBUG: processResults exiting")
 				return nil
 			}
 
@@ -332,9 +326,12 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 			return
 		case record, ok := <-recordsChan:
 			if !ok {
+				fmt.Printf(">>> DEBUG: Worker %d received closed channel, processing %d remaining texts\n",
+					id, len(batch))
 				if len(batch) > 0 {
 					o.processBatch(context.Background(), id, batch, batchMap, resultsChan)
 				}
+				fmt.Printf(">>> DEBUG: Worker %d exiting\n", id)
 				return
 			}
 
