@@ -3,7 +3,6 @@ package repositories
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -29,7 +28,7 @@ type Config struct {
 	BatchSize       int           // максимальный размер батча для запроса
 	Workers         int           // количество параллельных воркеров
 	DebugMode       bool          // режим отладки
-	ParallelQueries int           // количество параллельных запросов в батче // Добавить эту строку
+	ParallelQueries int           // количество параллельных запросов в батче
 }
 
 // QueryCache простой кэш для результатов запросов
@@ -63,7 +62,6 @@ func (c *QueryCache) Get(key string) ([]domain.GeoHit, bool) {
 	}
 
 	if time.Now().After(item.expiresAt) {
-		// Истекло, удалим асинхронно
 		go c.Delete(key)
 		return nil, false
 	}
@@ -89,8 +87,8 @@ func (c *QueryCache) Delete(key string) {
 	delete(c.items, key)
 }
 
-// FailedQueryInfo содержит детали о неудачном запросе
-type FailedQueryInfo struct {
+// QueryInfo содержит полную информацию о запросе
+type QueryInfo struct {
 	Text       string
 	Query      string
 	Error      error
@@ -98,6 +96,12 @@ type FailedQueryInfo struct {
 	HTTPBody   string
 	Attempts   int
 	WorkerID   int
+	Duration   time.Duration
+	Timestamp  time.Time
+	Hits       []domain.GeoHit
+	HitCount   int
+	Cached     bool
+	Response   string
 }
 
 // ManticoreClient реализует интерфейс GeonameRepositoryWithDebug
@@ -114,6 +118,61 @@ type ManticoreClient struct {
 	debugWriter  *writers.DebugWriter
 }
 
+// FailedQueryInfo содержит детали о неудачном запросе
+type FailedQueryInfo struct {
+	Text       string
+	Query      string
+	Error      error
+	HTTPStatus string
+	HTTPBody   string
+	Attempts   int
+	WorkerID   int
+}
+
+// NewManticoreClient создает новый клиент Manticore
+func NewManticoreClient(cfg Config) (*ManticoreClient, error) {
+	configuration := Manticoresearch.NewConfiguration()
+
+	if len(configuration.Servers) > 0 {
+		configuration.Servers[0].URL = cfg.BaseURL
+	}
+
+	configuration.HTTPClient = &http.Client{
+		Timeout: cfg.Timeout,
+	}
+
+	if cfg.DebugMode {
+		resp, err := configuration.HTTPClient.Get(cfg.BaseURL)
+		if err != nil {
+			log.Printf("Warning: cannot connect to Manticore at %s: %v", cfg.BaseURL, err)
+		} else {
+			defer resp.Body.Close()
+			log.Printf("Connected to Manticore at %s (status: %s)", cfg.BaseURL, resp.Status)
+		}
+	}
+
+	apiClient := Manticoresearch.NewAPIClient(configuration)
+
+	var cache *QueryCache
+	if cfg.CacheSize > 0 {
+		cache = NewQueryCache(cfg.CacheTTL)
+	}
+
+	requestPool := &sync.Pool{
+		New: func() interface{} {
+			return make([]string, 0, cfg.BatchSize)
+		},
+	}
+
+	return &ManticoreClient{
+		apiClient:   apiClient,
+		indexName:   cfg.IndexName,
+		config:      cfg,
+		cache:       cache,
+		requestPool: requestPool,
+	}, nil
+}
+
 // SetDebugWriter implements GeonameRepositoryWithDebug
 func (c *ManticoreClient) SetDebugWriter(writer *writers.DebugWriter) {
 	c.debugWriter = writer
@@ -128,17 +187,15 @@ func (c *ManticoreClient) GetStats() (success, failure int64) {
 
 // FindBatch implements GeonameRepository - для обратной совместимости
 func (c *ManticoreClient) FindBatch(ctx context.Context, entityTexts []string) (map[string][]domain.GeoHit, error) {
-	// Вызываем FindBatchWithInfo с workerID = -1
 	hits, _, err := c.FindBatchWithInfo(ctx, entityTexts, -1)
 	return hits, err
 }
 
-// FindBatchWithInfo - новая функция, возвращающая и хиты, и информацию
+// FindBatchWithInfo - ОСНОВНАЯ функция, возвращает и хиты, и информацию
 func (c *ManticoreClient) FindBatchWithInfo(ctx context.Context, entityTexts []string, workerID int) (map[string][]domain.GeoHit, map[string]*QueryInfo, error) {
 	result := make(map[string][]domain.GeoHit)
 	queryInfos := make(map[string]*QueryInfo)
 
-	// Разделяем на кэшированные и некэшированные
 	uncached := make([]string, 0)
 
 	for _, text := range entityTexts {
@@ -163,7 +220,6 @@ func (c *ManticoreClient) FindBatchWithInfo(ctx context.Context, entityTexts []s
 		return result, queryInfos, nil
 	}
 
-	// Выполняем запросы
 	type queryResult struct {
 		text string
 		hits []domain.GeoHit
@@ -172,7 +228,6 @@ func (c *ManticoreClient) FindBatchWithInfo(ctx context.Context, entityTexts []s
 	}
 
 	resultChan := make(chan queryResult, len(uncached))
-
 	batchCtx, batchCancel := context.WithTimeout(context.Background(), c.config.Timeout)
 	defer batchCancel()
 
@@ -238,176 +293,7 @@ func (c *ManticoreClient) FindBatchWithInfo(ctx context.Context, entityTexts []s
 	return result, queryInfos, nil
 }
 
-// NewManticoreClient создает новый клиент Manticore
-func NewManticoreClient(cfg Config) (*ManticoreClient, error) {
-	configuration := Manticoresearch.NewConfiguration()
-
-	// Устанавливаем URL сервера
-	if len(configuration.Servers) > 0 {
-		configuration.Servers[0].URL = cfg.BaseURL
-	}
-
-	// ВАЖНО: HTTPClient изначально nil, нужно создать новый
-	configuration.HTTPClient = &http.Client{
-		Timeout: cfg.Timeout,
-	}
-
-	// Проверяем соединение (опционально)
-	if cfg.DebugMode {
-		resp, err := configuration.HTTPClient.Get(cfg.BaseURL)
-		if err != nil {
-			log.Printf("Warning: cannot connect to Manticore at %s: %v", cfg.BaseURL, err)
-		} else {
-			defer resp.Body.Close()
-			log.Printf("Connected to Manticore at %s (status: %s)", cfg.BaseURL, resp.Status)
-		}
-	}
-
-	apiClient := Manticoresearch.NewAPIClient(configuration)
-
-	// Создаем кэш, если указан размер > 0
-	var cache *QueryCache
-	if cfg.CacheSize > 0 {
-		cache = NewQueryCache(cfg.CacheTTL)
-	}
-
-	// Пул объектов для построения запросов (для оптимизации памяти)
-	requestPool := &sync.Pool{
-		New: func() interface{} {
-			return make([]string, 0, cfg.BatchSize)
-		},
-	}
-
-	return &ManticoreClient{
-		apiClient:   apiClient,
-		indexName:   cfg.IndexName,
-		config:      cfg,
-		cache:       cache,
-		requestPool: requestPool,
-	}, nil
-}
-
-// executeBatchQuery выполняет групповой запрос к Manticore с workerID
-func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string, workerID int) ([]domain.GeoHit, error) {
-	if len(texts) == 0 {
-		return nil, nil
-	}
-
-	if c.config.DebugMode {
-		log.Printf("Worker %d: Processing %d individual queries for batch", workerID, len(texts))
-	}
-
-	// Создаем канал для результатов
-	type queryResult struct {
-		text string
-		hits []domain.GeoHit
-		info *QueryInfo
-		err  error
-	}
-
-	resultChan := make(chan queryResult, len(texts))
-
-	// Создаем отдельный контекст для этого батча
-	batchCtx, batchCancel := context.WithTimeout(context.Background(), c.config.Timeout)
-	defer batchCancel()
-
-	var wg sync.WaitGroup
-
-	// Ограничиваем параллелизм
-	semaphore := make(chan struct{}, c.config.ParallelQueries)
-
-	for _, text := range texts {
-		wg.Add(1)
-		go func(searchText string) {
-			defer wg.Done()
-
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-batchCtx.Done():
-				resultChan <- queryResult{
-					text: searchText,
-					err:  batchCtx.Err(),
-					info: &QueryInfo{
-						Text:      searchText,
-						Query:     "cancelled",
-						WorkerID:  workerID,
-						Timestamp: time.Now(),
-						Error:     batchCtx.Err(),
-					},
-				}
-				return
-			}
-
-			// Получаем все 3 возвращаемых значения
-			hits, info, err := c.executeSingleQuery(batchCtx, searchText, workerID)
-
-			select {
-			case resultChan <- queryResult{
-				text: searchText,
-				hits: hits,
-				info: info,
-				err:  err,
-			}:
-			case <-batchCtx.Done():
-			}
-		}(text)
-	}
-
-	// Закрываем канал после завершения всех горутин
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	// Собираем результаты
-	var allHits []domain.GeoHit
-	var allInfos []*QueryInfo
-
-	for result := range resultChan {
-		if result.err != nil {
-			if c.config.DebugMode && !errors.Is(result.err, context.DeadlineExceeded) {
-				log.Printf("Worker %d: Query for '%s' failed: %v", workerID, result.text, result.err)
-			}
-			// Сохраняем информацию об ошибке
-			if result.info != nil {
-				allInfos = append(allInfos, result.info)
-			}
-			continue
-		}
-		allHits = append(allHits, result.hits...)
-		if result.info != nil {
-			allInfos = append(allInfos, result.info)
-		}
-	}
-
-	// Сохраняем информацию для отладки (если нужно)
-	if c.debugWriter != nil && len(allInfos) > 0 {
-		// Здесь можно записать информацию в debugWriter если нужно
-		// Но это уже будет делать оркестратор через FindBatchWithInfo
-	}
-
-	return allHits, nil
-}
-
-// QueryInfo содержит полную информацию о запросе
-type QueryInfo struct {
-	Text       string
-	Query      string
-	Error      error
-	HTTPStatus string
-	HTTPBody   string
-	Attempts   int
-	WorkerID   int
-	Duration   time.Duration
-	Timestamp  time.Time
-	Hits       []domain.GeoHit
-	HitCount   int
-	Cached     bool
-	Response   string
-}
-
-// executeSingleQuery выполняет одиночный запрос и возвращает хиты, информацию и ошибку
+// executeSingleQuery выполняет одиночный запрос
 func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string, workerID int) ([]domain.GeoHit, *QueryInfo, error) {
 	escaped := c.escapeString(text)
 	query := fmt.Sprintf("SELECT * FROM %s WHERE match('\"^%s$\"')", c.indexName, escaped)
@@ -465,14 +351,12 @@ func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string, w
 		return nil, info, err
 	}
 
-	// Парсим ответ
 	hits, parseErr := c.parseResponse(resp)
 	if parseErr != nil {
 		info.Error = parseErr
 		return nil, info, parseErr
 	}
 
-	// Сохраняем сырой ответ для отладки
 	if resp != nil {
 		if actual := resp.GetActualInstance(); actual != nil {
 			if data, marshalErr := json.Marshal(actual); marshalErr == nil {
@@ -486,9 +370,69 @@ func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string, w
 	return hits, info, nil
 }
 
+// executeBatchQuery для внутреннего использования
+func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string, workerID int) ([]domain.GeoHit, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+
+	type queryResult struct {
+		text string
+		hits []domain.GeoHit
+		info *QueryInfo
+		err  error
+	}
+
+	resultChan := make(chan queryResult, len(texts))
+	batchCtx, batchCancel := context.WithTimeout(context.Background(), c.config.Timeout)
+	defer batchCancel()
+
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, c.config.ParallelQueries)
+
+	for _, text := range texts {
+		wg.Add(1)
+		go func(searchText string) {
+			defer wg.Done()
+
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-batchCtx.Done():
+				return
+			}
+
+			hits, _, err := c.executeSingleQuery(batchCtx, searchText, workerID)
+
+			select {
+			case resultChan <- queryResult{
+				text: searchText,
+				hits: hits,
+				err:  err,
+			}:
+			case <-batchCtx.Done():
+			}
+		}(text)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	var allHits []domain.GeoHit
+	for res := range resultChan {
+		if res.err != nil {
+			continue
+		}
+		allHits = append(allHits, res.hits...)
+	}
+
+	return allHits, nil
+}
+
 // escapeString экранирует спецсимволы для Manticore
 func (c *ManticoreClient) escapeString(s string) string {
-	// Для одиночных запросов достаточно простого экранирования
 	var builder strings.Builder
 	builder.Grow(len(s) * 2)
 
@@ -505,40 +449,34 @@ func (c *ManticoreClient) escapeString(s string) string {
 	return builder.String()
 }
 
-// parseResponse парсит ответ от Manticore в структуры GeoHit
+// parseResponse парсит ответ от Manticore
 func (c *ManticoreClient) parseResponse(resp *Manticoresearch.SqlResponse) ([]domain.GeoHit, error) {
 	if resp == nil {
 		return nil, nil
 	}
 
-	// Получаем актуальный экземпляр из oneOf обертки
 	actualInstance := resp.GetActualInstance()
 
 	switch v := actualInstance.(type) {
 	case *Manticoresearch.SqlObjResponse:
-		// Это объектный формат ответа (когда rawResponse=false)
 		return c.parseSqlObjResponse(v)
 	case *[]map[string]interface{}:
-		// Это массивный формат ответа (когда rawResponse=true)
 		return c.parseRawResponse(v)
 	default:
 		return nil, fmt.Errorf("unexpected response type: %T", actualInstance)
 	}
 }
 
-// parseSqlObjResponse парсит ответ в формате SqlObjResponse
 func (c *ManticoreClient) parseSqlObjResponse(resp *Manticoresearch.SqlObjResponse) ([]domain.GeoHit, error) {
 	if resp == nil {
 		return nil, nil
 	}
 
-	// Извлекаем hits из ответа
 	hits, ok := resp.GetHitsOk()
 	if !ok {
 		return nil, nil
 	}
 
-	// В hits должен быть массив "hits"
 	hitsArray, ok := hits["hits"].([]interface{})
 	if !ok {
 		return nil, nil
@@ -547,7 +485,6 @@ func (c *ManticoreClient) parseSqlObjResponse(resp *Manticoresearch.SqlObjRespon
 	return c.extractHitsFromArray(hitsArray)
 }
 
-// parseRawResponse парсит сырой ответ (массив записей)
 func (c *ManticoreClient) parseRawResponse(resp *[]map[string]interface{}) ([]domain.GeoHit, error) {
 	if resp == nil || len(*resp) == 0 {
 		return nil, nil
@@ -556,10 +493,9 @@ func (c *ManticoreClient) parseRawResponse(resp *[]map[string]interface{}) ([]do
 	result := make([]domain.GeoHit, 0, len(*resp))
 
 	for _, row := range *resp {
-		// В сыром ответе каждая строка - это прямая запись
 		hit, err := c.rowToGeoHit(row)
 		if err != nil {
-			continue // пропускаем некорректные строки
+			continue
 		}
 		result = append(result, hit)
 	}
@@ -567,7 +503,6 @@ func (c *ManticoreClient) parseRawResponse(resp *[]map[string]interface{}) ([]do
 	return result, nil
 }
 
-// extractHitsFromArray извлекает хиты из массива hits
 func (c *ManticoreClient) extractHitsFromArray(hitsArray []interface{}) ([]domain.GeoHit, error) {
 	result := make([]domain.GeoHit, 0, len(hitsArray))
 
@@ -577,7 +512,6 @@ func (c *ManticoreClient) extractHitsFromArray(hitsArray []interface{}) ([]domai
 			continue
 		}
 
-		// Извлекаем _source с данными
 		source, ok := hitMap["_source"].(map[string]interface{})
 		if !ok {
 			continue
@@ -593,11 +527,9 @@ func (c *ManticoreClient) extractHitsFromArray(hitsArray []interface{}) ([]domai
 	return result, nil
 }
 
-// sourceToGeoHit преобразует _source в GeoHit
 func (c *ManticoreClient) sourceToGeoHit(source map[string]interface{}) (domain.GeoHit, error) {
 	var geoHit domain.GeoHit
 
-	// ID
 	if id, ok := source["id"]; ok {
 		switch v := id.(type) {
 		case float64:
@@ -609,17 +541,14 @@ func (c *ManticoreClient) sourceToGeoHit(source map[string]interface{}) (domain.
 		}
 	}
 
-	// Name
 	if name, ok := source["name"].(string); ok {
 		geoHit.Name = name
 	}
 
-	// GeohashesString
 	if geohashes, ok := source["geohashes_string"].(string); ok {
 		geoHit.GeohashesString = geohashes
 	}
 
-	// GeohashesUint64 - может быть массивом или строкой
 	if geohashesUint, ok := source["geohashes_uint64"]; ok {
 		switch v := geohashesUint.(type) {
 		case []interface{}:
@@ -632,7 +561,6 @@ func (c *ManticoreClient) sourceToGeoHit(source map[string]interface{}) (domain.
 		}
 	}
 
-	// Occurrences
 	if occ, ok := source["occurrences"]; ok {
 		switch v := occ.(type) {
 		case float64:
@@ -642,7 +570,6 @@ func (c *ManticoreClient) sourceToGeoHit(source map[string]interface{}) (domain.
 		}
 	}
 
-	// FirstGeonameID
 	if firstID, ok := source["first_geoname_id"]; ok {
 		switch v := firstID.(type) {
 		case float64:
@@ -657,11 +584,9 @@ func (c *ManticoreClient) sourceToGeoHit(source map[string]interface{}) (domain.
 	return geoHit, nil
 }
 
-// rowToGeoHit преобразует сырую строку в GeoHit
 func (c *ManticoreClient) rowToGeoHit(row map[string]interface{}) (domain.GeoHit, error) {
 	var geoHit domain.GeoHit
 
-	// В сыром ответе поля могут быть прямо в корне
 	if id, ok := row["id"]; ok {
 		switch v := id.(type) {
 		case float64:
@@ -717,6 +642,5 @@ func (c *ManticoreClient) FindOne(ctx context.Context, entityText string) ([]dom
 
 // Close закрывает соединение
 func (c *ManticoreClient) Close() error {
-	// HTTP клиент не требует явного закрытия
 	return nil
 }

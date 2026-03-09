@@ -366,16 +366,6 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []s
 				o.mu.Lock()
 				o.filtered++
 				o.mu.Unlock()
-
-				if o.debugWriter != nil {
-					skipped := &domain.SkippedRecord{
-						Timestamp: time.Now(),
-						CSVRecord: record,
-						Reason:    "filtered_by_type",
-						WorkerID:  workerID,
-					}
-					o.debugWriter.WriteSkipped(skipped)
-				}
 				continue
 			}
 		}
