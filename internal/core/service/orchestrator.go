@@ -181,32 +181,30 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 
 	defer wg.Done()
 
-	// Собираем батч для запроса
 	batch := make([]string, 0, o.batchSize)
 	batchMap := make(map[string]domain.CSVRecord)
 
 	for {
 		select {
 		case <-ctx.Done():
+			// Получили сигнал завершения, но ДОзавершаем текущий батч
+			if len(batch) > 0 {
+				o.processBatch(context.Background(), id, batch, batchMap, resultsChan)
+			}
 			return
 		case record, ok := <-recordsChan:
 			if !ok {
-				// Канал закрыт, обрабатываем остаток
 				if len(batch) > 0 {
-					o.processBatch(ctx, id, batch, batchMap, resultsChan)
+					o.processBatch(context.Background(), id, batch, batchMap, resultsChan)
 				}
 				return
 			}
 
-			// Добавляем в текущий батч
 			batch = append(batch, record.EntityText)
 			batchMap[record.EntityText] = record
 
-			// Если батч набран, выполняем запрос
 			if len(batch) >= o.batchSize {
-				o.processBatch(ctx, id, batch, batchMap, resultsChan)
-
-				// Очищаем батч
+				o.processBatch(context.Background(), id, batch, batchMap, resultsChan)
 				batch = batch[:0]
 				batchMap = make(map[string]domain.CSVRecord)
 			}
