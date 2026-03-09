@@ -144,54 +144,34 @@ func NewManticoreClient(cfg Config) (*ManticoreClient, error) {
 	}, nil
 }
 
-// FindBatch выполняет поиск нескольких сущностей за один запрос
+// FindBatch выполняет поиск нескольких сущностей
 func (c *ManticoreClient) FindBatch(ctx context.Context, entityTexts []string) (map[string][]domain.GeoHit, error) {
 	result := make(map[string][]domain.GeoHit)
 
-	// Manticore может иметь ограничение на длину запроса
-	// Если текстов слишком много, разбиваем на подбатчи
-	const maxBatchSize = 50 // эмпирическое значение, можно сделать конфигурируемым
-
-	if len(entityTexts) > maxBatchSize {
-		if c.config.DebugMode {
-			log.Printf("Large batch %d, splitting into chunks of %d", len(entityTexts), maxBatchSize)
-		}
-
-		for i := 0; i < len(entityTexts); i += maxBatchSize {
-			end := i + maxBatchSize
-			if end > len(entityTexts) {
-				end = len(entityTexts)
-			}
-
-			chunk := entityTexts[i:end]
-			chunkResult, err := c.FindBatch(ctx, chunk)
-			if err != nil {
-				return nil, err
-			}
-
-			// Объединяем результаты
-			for k, v := range chunkResult {
-				result[k] = v
-			}
-		}
-
-		return result, nil
-	}
-
 	// Разделяем на кэшированные и некэшированные запросы
-	uncached := c.filterCached(entityTexts, result)
+	uncached := make([]string, 0)
+
+	for _, text := range entityTexts {
+		if c.cache != nil {
+			if hits, ok := c.cache.Get(text); ok {
+				result[text] = hits
+				continue
+			}
+		}
+		uncached = append(uncached, text)
+	}
 
 	if len(uncached) == 0 {
 		return result, nil
 	}
 
-	// Выполняем запрос к Manticore для некэшированных
+	// Выполняем запросы для некэшированных текстов
 	hits, err := c.executeBatchQuery(ctx, uncached)
 	if err != nil {
 		return nil, fmt.Errorf("batch query failed: %w", err)
 	}
 
-	// Группируем результаты по entity_text
+	// Группируем результаты по имени
 	for _, hit := range hits {
 		if _, ok := result[hit.Name]; !ok {
 			result[hit.Name] = make([]domain.GeoHit, 0)
@@ -237,28 +217,78 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 	default:
 	}
 
-	// Строим SQL запрос с OR для всех текстов
-	conditions := make([]string, len(texts))
-	for i, text := range texts {
-		escaped := c.escapeString(text)
-		// Используем точное совпадение с ^ и $
-		conditions[i] = fmt.Sprintf("match('\"^%s$\"')", escaped)
+	// Для HTTP API мы не можем использовать OR с большим количеством условий
+	// Вместо этого делаем отдельные запросы для каждого текста, но параллельно
+	if c.config.DebugMode {
+		log.Printf("Processing %d individual queries for batch", len(texts))
 	}
 
-	query := fmt.Sprintf("SELECT * FROM %s WHERE %s",
-		c.indexName,
-		strings.Join(conditions, " OR "))
+	// Создаем канал для результатов
+	type queryResult struct {
+		text string
+		hits []domain.GeoHit
+		err  error
+	}
+
+	resultChan := make(chan queryResult, len(texts))
+
+	// Ограничиваем параллелизм на уровне запросов
+	semaphore := make(chan struct{}, 5) // максимум 5 параллельных запросов
+
+	var wg sync.WaitGroup
+
+	for _, text := range texts {
+		wg.Add(1)
+		go func(searchText string) {
+			defer wg.Done()
+
+			// Захватываем семафор
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Выполняем одиночный запрос
+			hits, err := c.executeSingleQuery(ctx, searchText)
+
+			resultChan <- queryResult{
+				text: searchText,
+				hits: hits,
+				err:  err,
+			}
+		}(text)
+	}
+
+	// Закрываем канал после завершения всех горутин
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Собираем результаты
+	var allHits []domain.GeoHit
+	for result := range resultChan {
+		if result.err != nil {
+			if c.config.DebugMode {
+				log.Printf("Query for '%s' failed: %v", result.text, result.err)
+			}
+			continue
+		}
+		allHits = append(allHits, result.hits...)
+	}
+
+	return allHits, nil
+}
+
+// executeSingleQuery выполняет одиночный запрос к Manticore
+func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string) ([]domain.GeoHit, error) {
+	// Экранируем спецсимволы
+	escaped := c.escapeString(text)
+
+	// Формируем запрос с точным совпадением
+	query := fmt.Sprintf("SELECT * FROM %s WHERE match('\"^%s$\"')",
+		c.indexName, escaped)
 
 	if c.config.DebugMode {
-		// Логируем первые несколько условий
-		if len(texts) > 3 {
-			log.Printf("Query with %d terms (first 3): %v ...",
-				len(texts), texts[:3])
-			log.Printf("SQL: %s", query[:min(500, len(query))])
-		} else {
-			log.Printf("Query terms: %v", texts)
-			log.Printf("SQL: %s", query)
-		}
+		log.Printf("Single query for '%s': %s", text, query)
 	}
 
 	// Выполняем запрос с повторными попытками
@@ -293,19 +323,12 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 			break
 		}
 
-		// Детальное логирование ошибки
-		if c.config.DebugMode {
-			log.Printf("Query attempt %d failed: %v", attempt+1, err)
+		if c.config.DebugMode && attempt == c.config.MaxRetries {
+			log.Printf("Query failed for '%s': %v", text, err)
 			if httpResp != nil {
 				body, _ := io.ReadAll(httpResp.Body)
-				log.Printf("HTTP Status: %s", httpResp.Status)
-				log.Printf("HTTP Body: %s", string(body))
+				log.Printf("HTTP Status: %s, Body: %s", httpResp.Status, string(body))
 				httpResp.Body.Close()
-
-				// Сохраняем проблемный запрос в файл для анализа
-				if attempt == c.config.MaxRetries {
-					c.saveFailedQuery(query, texts, httpResp.Status, string(body))
-				}
 			}
 		}
 
@@ -315,7 +338,7 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("query failed after %d attempts: %w", c.config.MaxRetries+1, err)
+		return nil, fmt.Errorf("query failed for '%s': %w", text, err)
 	}
 
 	return c.parseResponse(resp)
@@ -348,25 +371,17 @@ func min(a, b int) int {
 	return b
 }
 
-// escapeString экранирует спецсимволы для Manticore согласно официальной документации
+// escapeString экранирует спецсимволы для Manticore
 func (c *ManticoreClient) escapeString(s string) string {
-	// Список символов, которые нужно экранировать согласно документации
-	// ! " $ ' ( ) - / < @ \ ^ | ~
-
+	// Для одиночных запросов достаточно простого экранирования
 	var builder strings.Builder
-	builder.Grow(len(s) * 2) // Примерно с запасом
+	builder.Grow(len(s) * 2)
 
 	for _, ch := range s {
 		switch ch {
-		case '!', '"', '$', '\'', '(', ')', '-', '/', '<', '@', '^', '|', '~':
-			// Эти символы экранируются одним обратным слешем
+		case '\\', '"', '\'', '!', '$', '(', ')', '-', '/', '<', '@', '^', '|', '~':
 			builder.WriteByte('\\')
 			builder.WriteRune(ch)
-		case '\\':
-			// Обратная косая черта требует 4 слеша в SQL
-			// Но так как мы формируем SQL запрос, а не JSON,
-			// используем двойное экранирование
-			builder.WriteString(`\\\\`)
 		default:
 			builder.WriteRune(ch)
 		}
