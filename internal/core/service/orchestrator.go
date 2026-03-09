@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
@@ -11,21 +10,24 @@ import (
 	"github.com/terratensor/geostreamer/internal/ports/input"
 	"github.com/terratensor/geostreamer/internal/ports/output"
 	"github.com/terratensor/geostreamer/internal/ports/repository"
+	"github.com/terratensor/geostreamer/pkg/logger"
 )
 
 // Orchestrator управляет всем пайплайном обработки
 type Orchestrator struct {
-	source     input.RecordSource
-	repo       repository.GeonameRepository
-	writer     output.ResultWriter
-	workers    int
-	batchSize  int
-	results    map[string]*domain.GeoResult
-	mu         sync.RWMutex
-	processed  int64
-	skipped    int64
-	startTime  time.Time
-	flushCount int // сбрасывать результаты после N doc_id
+	source      input.RecordSource
+	repo        repository.GeonameRepository
+	writer      output.ResultWriter
+	workers     int
+	batchSize   int
+	results     map[string]*domain.GeoResult
+	mu          sync.RWMutex
+	processed   int64
+	skipped     int64
+	startTime   time.Time
+	flushCount  int
+	log         *logger.Logger
+	statsTicker *time.Ticker
 }
 
 // NewOrchestrator создает новый оркестратор
@@ -34,39 +36,30 @@ func NewOrchestrator(
 	repo repository.GeonameRepository,
 	writer output.ResultWriter,
 	workers, batchSize, flushCount int,
+	statsInterval time.Duration,
 ) *Orchestrator {
 	return &Orchestrator{
-		source:     source,
-		repo:       repo,
-		writer:     writer,
-		workers:    workers,
-		batchSize:  batchSize,
-		flushCount: flushCount,
-		results:    make(map[string]*domain.GeoResult),
+		source:      source,
+		repo:        repo,
+		writer:      writer,
+		workers:     workers,
+		batchSize:   batchSize,
+		flushCount:  flushCount,
+		results:     make(map[string]*domain.GeoResult),
+		log:         logger.Get().WithPrefix("Orchestrator"),
+		statsTicker: time.NewTicker(statsInterval),
 	}
 }
 
 // Process запускает обработку
 func (o *Orchestrator) Process(ctx context.Context) error {
-	log.Println("Starting processing...")
+	o.log.Info("Starting processing...")
 	o.startTime = time.Now()
 
-	// Добавим горутину для вывода статистики каждые 5 секунд
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				o.printStats()
-			}
-		}
-	}()
-
 	recordsChan, errChan := o.source.ReadRecords(ctx)
+
+	// Запускаем горутину для вывода статистики
+	go o.statsReporter(ctx)
 
 	// Создаем дочерний контекст для воркеров
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -82,38 +75,117 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 		go o.worker(workerCtx, i, recordsChan, resultsChan, &wg)
 	}
 
-	// Закрываем resultsChan после завершения всех воркеров
+	// Канал для сигнала о завершении всех воркеров
+	done := make(chan struct{})
 	go func() {
 		wg.Wait()
-		close(resultsChan)
+		close(done)
 	}()
 
 	// Аккумулируем и записываем результаты
-	if err := o.processResults(ctx, resultsChan); err != nil {
-		return err
+	resultErr := o.processResults(ctx, resultsChan)
+
+	// Ждем завершения воркеров или сигнала отмены
+	select {
+	case <-done:
+		o.log.Info("All workers completed")
+	case <-ctx.Done():
+		o.log.Warn("Context canceled, waiting for workers to finish...")
+		select {
+		case <-done:
+			o.log.Info("Workers finished gracefully")
+		case <-time.After(5 * time.Second):
+			o.log.Warn("Workers did not finish in time, forcing shutdown")
+		}
 	}
 
 	// Проверяем ошибки
 	select {
 	case err := <-errChan:
-		if err != nil {
+		if err != nil && err != context.Canceled {
 			return fmt.Errorf("error from source: %w", err)
 		}
 	default:
 	}
 
 	// Финальный сброс всех результатов
-	if err := o.flushAllResults(ctx); err != nil {
+	if err := o.flushAllResults(ctx); err != nil && err != context.Canceled {
 		return fmt.Errorf("failed to flush final results: %w", err)
 	}
 
-	// Выводим статистику
-	elapsed := time.Since(o.startTime)
-	stats := o.writer.GetStats()
-	log.Printf("Processing completed. Records: %d, Skipped: %d, Written: %d, Bytes: %d, Time: %s\n",
-		o.processed, o.skipped, stats.RecordsWritten, stats.BytesWritten, elapsed)
+	// Выводим финальную статистику
+	o.printFinalStats()
 
-	return nil
+	return resultErr
+}
+
+// statsReporter периодически выводит статистику
+func (o *Orchestrator) statsReporter(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			o.statsTicker.Stop()
+			return
+		case <-o.statsTicker.C:
+			o.printStats()
+		}
+	}
+}
+
+// printStats выводит текущую статистику
+func (o *Orchestrator) printStats() {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	writerStats := o.writer.GetStats()
+
+	// Если у клиента есть метод GetStats, вызываем его
+	var manticoreSuccess, manticoreFailure int64
+	if repo, ok := o.repo.(interface{ GetStats() (int64, int64) }); ok {
+		manticoreSuccess, manticoreFailure = repo.GetStats()
+	}
+
+	stats := logger.Stats{
+		ProcessedRecords: o.processed,
+		SkippedRecords:   o.skipped,
+		WrittenRecords:   writerStats.RecordsWritten,
+		BytesWritten:     writerStats.BytesWritten,
+		ManticoreSuccess: manticoreSuccess,
+		ManticoreFailure: manticoreFailure,
+		ProcessingTime:   time.Since(o.startTime),
+	}
+
+	o.log.PrintStats(stats)
+}
+
+// printFinalStats выводит финальную статистику
+func (o *Orchestrator) printFinalStats() {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	writerStats := o.writer.GetStats()
+
+	var manticoreSuccess, manticoreFailure int64
+	if repo, ok := o.repo.(interface{ GetStats() (int64, int64) }); ok {
+		manticoreSuccess, manticoreFailure = repo.GetStats()
+	}
+
+	elapsed := time.Since(o.startTime)
+
+	o.log.Info("=== FINAL STATISTICS ===")
+	o.log.Info("Total processing time: %v", elapsed)
+	o.log.Info("Records processed: %d", o.processed)
+	o.log.Info("Records skipped: %d", o.skipped)
+	o.log.Info("Records written: %d", writerStats.RecordsWritten)
+	o.log.Info("Bytes written: %d", writerStats.BytesWritten)
+	o.log.Info("Manticore queries: %d success, %d failures",
+		manticoreSuccess, manticoreFailure)
+
+	if o.processed > 0 {
+		rate := float64(o.processed) / elapsed.Seconds()
+		o.log.Info("Processing rate: %.2f records/sec", rate)
+	}
+	o.log.Info("========================")
 }
 
 // processResults обрабатывает поток результатов
@@ -126,7 +198,6 @@ func (o *Orchestrator) processResults(ctx context.Context, resultsChan <-chan *d
 			return ctx.Err()
 		case result, ok := <-resultsChan:
 			if !ok {
-				// Канал закрыт, записываем остаток
 				if len(batch) > 0 {
 					if err := o.writer.WriteBatch(ctx, batch); err != nil {
 						return err
@@ -137,7 +208,6 @@ func (o *Orchestrator) processResults(ctx context.Context, resultsChan <-chan *d
 
 			o.mergeResult(result)
 
-			// Если набрали достаточно для сброса
 			if len(o.results) >= o.flushCount {
 				batch = o.prepareBatch()
 				if err := o.writer.WriteBatch(ctx, batch); err != nil {
@@ -181,7 +251,6 @@ func (o *Orchestrator) flushAllResults(ctx context.Context) error {
 		return err
 	}
 
-	// Сбрасываем буфер writer на диск
 	if err := o.writer.Flush(); err != nil {
 		return err
 	}
@@ -196,14 +265,16 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 
 	defer wg.Done()
 
+	workerLog := o.log.WithPrefix(fmt.Sprintf("Worker-%d", id))
+
 	batch := make([]string, 0, o.batchSize)
 	batchMap := make(map[string]domain.CSVRecord)
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Получили сигнал завершения, но ДОзавершаем текущий батч
 			if len(batch) > 0 {
+				workerLog.Debug("Finishing with %d remaining texts", len(batch))
 				o.processBatch(context.Background(), id, batch, batchMap, resultsChan)
 			}
 			return
@@ -219,7 +290,7 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 			batchMap[record.EntityText] = record
 
 			if len(batch) >= o.batchSize {
-				o.processBatch(context.Background(), id, batch, batchMap, resultsChan)
+				o.processBatch(ctx, id, batch, batchMap, resultsChan)
 				batch = batch[:0]
 				batchMap = make(map[string]domain.CSVRecord)
 			}
@@ -231,20 +302,20 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []string,
 	records map[string]domain.CSVRecord, resultsChan chan<- *domain.GeoResult) {
 
+	workerLog := o.log.WithPrefix(fmt.Sprintf("Worker-%d", workerID))
+
 	if o.source.GetProgress()%10000 == 0 {
-		log.Printf("Worker %d: processing batch of %d texts (total progress: %d)\n",
-			workerID, len(texts), o.source.GetProgress())
+		workerLog.Info("Processing batch of %d texts (total progress: %d)",
+			len(texts), o.source.GetProgress())
 	}
 
-	// Выполняем запрос
 	hitsMap, err := o.repo.FindBatch(ctx, texts)
 	if err != nil {
-		log.Printf("Worker %d: batch query failed: %v\n", workerID, err)
+		workerLog.Error("Batch query failed: %v", err)
 		o.skipped += int64(len(texts))
 		return
 	}
 
-	// Для каждого найденного результата создаем GeoResult
 	found := 0
 	for text, hits := range hitsMap {
 		record, ok := records[text]
@@ -252,10 +323,8 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []s
 			continue
 		}
 
-		// Создаем результат для этого doc_id
 		result := domain.NewGeoResult(record.DocID)
 
-		// Добавляем все геохеши из найденных hits
 		for _, hit := range hits {
 			strings, uints := hit.ToGeoResult()
 			for _, s := range strings {
@@ -266,7 +335,6 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []s
 			}
 		}
 
-		// Если есть хотя бы один геохеш, отправляем результат
 		if len(result.GeohashesStringMap) > 0 || len(result.GeohashesUint64Map) > 0 {
 			resultsChan <- result
 			o.processed++
@@ -276,7 +344,6 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []s
 		}
 	}
 
-	// Записываем пропущенные (не найденные) тексты
 	o.skipped += int64(len(texts) - found)
 }
 
@@ -291,7 +358,6 @@ func (o *Orchestrator) mergeResult(result *domain.GeoResult) {
 		return
 	}
 
-	// Объединяем множества
 	for s := range result.GeohashesStringMap {
 		existing.GeohashesStringMap[s] = struct{}{}
 	}
@@ -302,6 +368,8 @@ func (o *Orchestrator) mergeResult(result *domain.GeoResult) {
 
 // Close закрывает ресурсы
 func (o *Orchestrator) Close() error {
+	o.statsTicker.Stop()
+
 	if err := o.source.Close(); err != nil {
 		return err
 	}
@@ -309,22 +377,4 @@ func (o *Orchestrator) Close() error {
 		return err
 	}
 	return o.writer.Close()
-}
-
-// printStats выводит текущую статистику
-func (o *Orchestrator) printStats() {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-
-	writerStats := o.writer.GetStats()
-
-	// Если у клиента есть метод GetStats, вызываем его
-	if repo, ok := o.repo.(interface{ GetStats() (int64, int64) }); ok {
-		success, failure := repo.GetStats()
-		log.Printf("STATS: processed=%d, skipped=%d, written=%d, manticore_success=%d, manticore_failure=%d",
-			o.processed, o.skipped, writerStats.RecordsWritten, success, failure)
-	} else {
-		log.Printf("STATS: processed=%d, skipped=%d, written=%d",
-			o.processed, o.skipped, writerStats.RecordsWritten)
-	}
 }

@@ -37,6 +37,12 @@ type Config struct {
 		UseGzip       bool
 		PrettyPrint   bool
 	}
+
+	Logging struct {
+		Level         string        // "debug", "info", "warn", "error"
+		OutputFile    string        // если пусто - в stdout
+		StatsInterval time.Duration // интервал вывода статистики
+	}
 }
 
 // Load загружает конфигурацию из флагов командной строки
@@ -70,6 +76,11 @@ func Load() *Config {
 	flag.IntVar(&cfg.Output.BufferSize, "output-buffer", 1024*1024, "Output buffer size in bytes")
 	flag.BoolVar(&cfg.Output.UseGzip, "output-gzip", false, "Compress output file with gzip")
 	flag.BoolVar(&cfg.Output.PrettyPrint, "output-pretty", false, "Pretty print JSON (slower, larger files)")
+
+	// Logging flags
+	flag.StringVar(&cfg.Logging.Level, "log-level", "info", "Log level (debug, info, warn, error)")
+	flag.StringVar(&cfg.Logging.OutputFile, "log-file", "", "Log file path (empty for stdout)")
+	flag.DurationVar(&cfg.Logging.StatsInterval, "log-stats", 10*time.Second, "Statistics output interval")
 
 	flag.Parse()
 
