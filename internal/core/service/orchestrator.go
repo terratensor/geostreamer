@@ -9,30 +9,40 @@ import (
 
 	"github.com/terratensor/geostreamer/internal/core/domain"
 	"github.com/terratensor/geostreamer/internal/ports/input"
+	"github.com/terratensor/geostreamer/internal/ports/output"
 	"github.com/terratensor/geostreamer/internal/ports/repository"
 )
 
 // Orchestrator управляет всем пайплайном обработки
 type Orchestrator struct {
-	source    input.RecordSource
-	repo      repository.GeonameRepository
-	workers   int
-	batchSize int
-	results   map[string]*domain.GeoResult
-	mu        sync.RWMutex
-	processed int64
-	skipped   int64
-	startTime time.Time
+	source     input.RecordSource
+	repo       repository.GeonameRepository
+	writer     output.ResultWriter
+	workers    int
+	batchSize  int
+	results    map[string]*domain.GeoResult
+	mu         sync.RWMutex
+	processed  int64
+	skipped    int64
+	startTime  time.Time
+	flushCount int // сбрасывать результаты после N doc_id
 }
 
 // NewOrchestrator создает новый оркестратор
-func NewOrchestrator(source input.RecordSource, repo repository.GeonameRepository, workers, batchSize int) *Orchestrator {
+func NewOrchestrator(
+	source input.RecordSource,
+	repo repository.GeonameRepository,
+	writer output.ResultWriter,
+	workers, batchSize, flushCount int,
+) *Orchestrator {
 	return &Orchestrator{
-		source:    source,
-		repo:      repo,
-		workers:   workers,
-		batchSize: batchSize,
-		results:   make(map[string]*domain.GeoResult),
+		source:     source,
+		repo:       repo,
+		writer:     writer,
+		workers:    workers,
+		batchSize:  batchSize,
+		flushCount: flushCount,
+		results:    make(map[string]*domain.GeoResult),
 	}
 }
 
@@ -43,6 +53,10 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 
 	recordsChan, errChan := o.source.ReadRecords(ctx)
 
+	// Создаем дочерний контекст для воркеров
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// Создаем пул воркеров
 	var wg sync.WaitGroup
 	resultsChan := make(chan *domain.GeoResult, o.workers*2)
@@ -50,7 +64,7 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 	// Запускаем воркеры
 	for i := 0; i < o.workers; i++ {
 		wg.Add(1)
-		go o.worker(ctx, i, recordsChan, resultsChan, &wg)
+		go o.worker(workerCtx, i, recordsChan, resultsChan, &wg)
 	}
 
 	// Закрываем resultsChan после завершения всех воркеров
@@ -59,9 +73,9 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 		close(resultsChan)
 	}()
 
-	// Аккумулируем результаты
-	for result := range resultsChan {
-		o.mergeResult(result)
+	// Аккумулируем и записываем результаты
+	if err := o.processResults(ctx, resultsChan); err != nil {
+		return err
 	}
 
 	// Проверяем ошибки
@@ -73,11 +87,91 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 	default:
 	}
 
+	// Финальный сброс всех результатов
+	if err := o.flushAllResults(ctx); err != nil {
+		return fmt.Errorf("failed to flush final results: %w", err)
+	}
+
 	// Выводим статистику
 	elapsed := time.Since(o.startTime)
-	log.Printf("Processing completed. Records: %d, Skipped: %d, Time: %s\n",
-		o.processed, o.skipped, elapsed)
+	stats := o.writer.GetStats()
+	log.Printf("Processing completed. Records: %d, Skipped: %d, Written: %d, Bytes: %d, Time: %s\n",
+		o.processed, o.skipped, stats.RecordsWritten, stats.BytesWritten, elapsed)
 
+	return nil
+}
+
+// processResults обрабатывает поток результатов
+func (o *Orchestrator) processResults(ctx context.Context, resultsChan <-chan *domain.GeoResult) error {
+	batch := make([]domain.GeoOutput, 0, o.flushCount)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case result, ok := <-resultsChan:
+			if !ok {
+				// Канал закрыт, записываем остаток
+				if len(batch) > 0 {
+					if err := o.writer.WriteBatch(ctx, batch); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+
+			o.mergeResult(result)
+
+			// Если набрали достаточно для сброса
+			if len(o.results) >= o.flushCount {
+				batch = o.prepareBatch()
+				if err := o.writer.WriteBatch(ctx, batch); err != nil {
+					return err
+				}
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+// prepareBatch подготавливает батч для записи
+func (o *Orchestrator) prepareBatch() []domain.GeoOutput {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	batch := make([]domain.GeoOutput, 0, len(o.results))
+	for docID, result := range o.results {
+		batch = append(batch, result.ToOutput())
+		delete(o.results, docID)
+	}
+
+	return batch
+}
+
+// flushAllResults сбрасывает все оставшиеся результаты
+func (o *Orchestrator) flushAllResults(ctx context.Context) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if len(o.results) == 0 {
+		return nil
+	}
+
+	batch := make([]domain.GeoOutput, 0, len(o.results))
+	for _, result := range o.results {
+		batch = append(batch, result.ToOutput())
+	}
+
+	if err := o.writer.WriteBatch(ctx, batch); err != nil {
+		return err
+	}
+
+	// Сбрасываем буфер writer на диск
+	if err := o.writer.Flush(); err != nil {
+		return err
+	}
+
+	o.results = make(map[string]*domain.GeoResult)
 	return nil
 }
 
@@ -91,24 +185,32 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 	batch := make([]string, 0, o.batchSize)
 	batchMap := make(map[string]domain.CSVRecord)
 
-	for record := range recordsChan {
-		// Добавляем в текущий батч
-		batch = append(batch, record.EntityText)
-		batchMap[record.EntityText] = record
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case record, ok := <-recordsChan:
+			if !ok {
+				// Канал закрыт, обрабатываем остаток
+				if len(batch) > 0 {
+					o.processBatch(ctx, id, batch, batchMap, resultsChan)
+				}
+				return
+			}
 
-		// Если батч набран, выполняем запрос
-		if len(batch) >= o.batchSize {
-			o.processBatch(ctx, id, batch, batchMap, resultsChan)
+			// Добавляем в текущий батч
+			batch = append(batch, record.EntityText)
+			batchMap[record.EntityText] = record
 
-			// Очищаем батч
-			batch = batch[:0]
-			batchMap = make(map[string]domain.CSVRecord)
+			// Если батч набран, выполняем запрос
+			if len(batch) >= o.batchSize {
+				o.processBatch(ctx, id, batch, batchMap, resultsChan)
+
+				// Очищаем батч
+				batch = batch[:0]
+				batchMap = make(map[string]domain.CSVRecord)
+			}
 		}
-	}
-
-	// Обрабатываем остаток
-	if len(batch) > 0 {
-		o.processBatch(ctx, id, batch, batchMap, resultsChan)
 	}
 }
 
@@ -116,7 +218,10 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []string,
 	records map[string]domain.CSVRecord, resultsChan chan<- *domain.GeoResult) {
 
-	log.Printf("Worker %d: processing batch of %d texts\n", workerID, len(texts))
+	if o.source.GetProgress()%10000 == 0 {
+		log.Printf("Worker %d: processing batch of %d texts (total progress: %d)\n",
+			workerID, len(texts), o.source.GetProgress())
+	}
 
 	// Выполняем запрос
 	hitsMap, err := o.repo.FindBatch(ctx, texts)
@@ -127,6 +232,7 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []s
 	}
 
 	// Для каждого найденного результата создаем GeoResult
+	found := 0
 	for text, hits := range hitsMap {
 		record, ok := records[text]
 		if !ok {
@@ -151,13 +257,14 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []s
 		if len(result.GeohashesStringMap) > 0 || len(result.GeohashesUint64Map) > 0 {
 			resultsChan <- result
 			o.processed++
+			found++
 		} else {
 			o.skipped++
 		}
 	}
 
 	// Записываем пропущенные (не найденные) тексты
-	o.skipped += int64(len(texts) - len(hitsMap))
+	o.skipped += int64(len(texts) - found)
 }
 
 // mergeResult объединяет результаты по doc_id
@@ -185,5 +292,8 @@ func (o *Orchestrator) Close() error {
 	if err := o.source.Close(); err != nil {
 		return err
 	}
-	return o.repo.Close()
+	if err := o.repo.Close(); err != nil {
+		return err
+	}
+	return o.writer.Close()
 }

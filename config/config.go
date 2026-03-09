@@ -28,6 +28,14 @@ type Config struct {
 		Workers    int
 		DebugMode  bool
 	}
+
+	Output struct {
+		Path          string
+		FlushInterval time.Duration
+		BufferSize    int
+		UseGzip       bool
+		PrettyPrint   bool
+	}
 }
 
 // Load загружает конфигурацию из флагов командной строки
@@ -45,14 +53,21 @@ func Load() *Config {
 	// Manticore flags
 	flag.StringVar(&cfg.Manticore.BaseURL, "manticore-url", "http://localhost:9308", "Manticore Search URL")
 	flag.StringVar(&cfg.Manticore.IndexName, "manticore-index", "geoname_dict", "Manticore index name")
-	flag.DurationVar(&cfg.Manticore.Timeout, "manticore-timeout", 30*time.Second, "Manticore query timeout")
+	flag.DurationVar(&cfg.Manticore.Timeout, "manticore-timeout", 60*time.Second, "Manticore query timeout")
 	flag.IntVar(&cfg.Manticore.MaxRetries, "manticore-retries", 3, "Manticore query retries")
-	flag.DurationVar(&cfg.Manticore.RetryDelay, "manticore-retry-delay", 1*time.Second, "Delay between retries")
+	flag.DurationVar(&cfg.Manticore.RetryDelay, "manticore-retry-delay", 2*time.Second, "Delay between retries")
 	flag.IntVar(&cfg.Manticore.CacheSize, "manticore-cache-size", 10000, "Manticore query cache size")
 	flag.DurationVar(&cfg.Manticore.CacheTTL, "manticore-cache-ttl", 1*time.Hour, "Manticore cache TTL")
 	flag.IntVar(&cfg.Manticore.BatchSize, "manticore-batch", 100, "Manticore batch query size")
 	flag.IntVar(&cfg.Manticore.Workers, "manticore-workers", 10, "Number of parallel Manticore workers")
 	flag.BoolVar(&cfg.Manticore.DebugMode, "manticore-debug", false, "Manticore client debug mode")
+
+	// Output flags
+	flag.StringVar(&cfg.Output.Path, "output", "results.ndjson", "Path to output NDJSON file")
+	flag.DurationVar(&cfg.Output.FlushInterval, "output-flush", 5*time.Second, "Output file flush interval")
+	flag.IntVar(&cfg.Output.BufferSize, "output-buffer", 1024*1024, "Output buffer size in bytes")
+	flag.BoolVar(&cfg.Output.UseGzip, "output-gzip", false, "Compress output file with gzip")
+	flag.BoolVar(&cfg.Output.PrettyPrint, "output-pretty", false, "Pretty print JSON (slower, larger files)")
 
 	flag.Parse()
 

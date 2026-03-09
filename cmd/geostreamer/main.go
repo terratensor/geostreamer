@@ -9,6 +9,7 @@ import (
 	"github.com/terratensor/geostreamer/config"
 	"github.com/terratensor/geostreamer/internal/adapters/readers"
 	"github.com/terratensor/geostreamer/internal/adapters/repositories"
+	"github.com/terratensor/geostreamer/internal/adapters/writers"
 	"github.com/terratensor/geostreamer/internal/core/service"
 )
 
@@ -56,8 +57,29 @@ func main() {
 	}
 	defer repo.Close()
 
+	// Создаем NDJSON writer
+	writerCfg := writers.NDJSONWriterConfig{
+		FilePath:      cfg.Output.Path,
+		FlushInterval: cfg.Output.FlushInterval,
+		BufferSize:    cfg.Output.BufferSize,
+		UseGzip:       cfg.Output.UseGzip,
+	}
+
+	writer, err := writers.NewNDJSONWriter(writerCfg)
+	if err != nil {
+		log.Fatalf("Failed to create output writer: %v", err)
+	}
+	defer writer.Close()
+
 	// Создаем оркестратор
-	orch := service.NewOrchestrator(source, repo, cfg.Manticore.Workers, cfg.Manticore.BatchSize)
+	orch := service.NewOrchestrator(
+		source,
+		repo,
+		writer,
+		cfg.Manticore.Workers,
+		cfg.Manticore.BatchSize,
+		1000, // сбрасывать после 1000 doc_id
+	)
 
 	// Запускаем обработку
 	if err := orch.Process(ctx); err != nil {
