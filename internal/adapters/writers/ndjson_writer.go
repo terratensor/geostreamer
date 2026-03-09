@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,10 +51,10 @@ func NewNDJSONWriter(cfg NDJSONWriterConfig) (*NDJSONWriter, error) {
 		return nil, fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	// Открываем файл
-	file, err := os.Create(filePath)
+	// Открываем файл в режиме добавления (O_APPEND) и создания если не существует
+	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create output file: %w", err)
+		return nil, fmt.Errorf("failed to open output file: %w", err)
 	}
 
 	// Устанавливаем размер буфера (по умолчанию 1MB)
@@ -66,6 +67,10 @@ func NewNDJSONWriter(cfg NDJSONWriterConfig) (*NDJSONWriter, error) {
 
 	var gzipWriter *gzip.Writer
 	if cfg.UseGzip {
+		// Для gzip нельзя просто добавить в конец, нужно перезаписывать
+		// Поэтому при использовании gzip предупреждаем
+		log.Printf("Warning: gzip mode doesn't support appending, file will be overwritten")
+		file, _ = os.Create(filePath)
 		gzipWriter = gzip.NewWriter(bufWriter)
 	}
 

@@ -89,11 +89,14 @@ func (c *QueryCache) Delete(key string) {
 
 // ManticoreClient реализует интерфейс GeonameRepository
 type ManticoreClient struct {
-	apiClient   *Manticoresearch.APIClient
-	indexName   string
-	config      Config
-	cache       *QueryCache
-	requestPool *sync.Pool
+	apiClient    *Manticoresearch.APIClient
+	indexName    string
+	config       Config
+	cache        *QueryCache
+	requestPool  *sync.Pool
+	successCount int64        // Добавить
+	failureCount int64        // Добавить
+	mu           sync.RWMutex // Добавить
 }
 
 // NewManticoreClient создает новый клиент Manticore
@@ -321,7 +324,16 @@ func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string) (
 			Execute()
 
 		if err == nil {
+			c.mu.Lock()
+			c.successCount++
+			c.mu.Unlock()
 			break
+		}
+
+		if attempt == c.config.MaxRetries {
+			c.mu.Lock()
+			c.failureCount++
+			c.mu.Unlock()
 		}
 
 		if c.config.DebugMode && attempt == c.config.MaxRetries {
@@ -343,6 +355,13 @@ func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string) (
 	}
 
 	return c.parseResponse(resp)
+}
+
+// Добавить метод для получения статистики
+func (c *ManticoreClient) GetStats() (success, failure int64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.successCount, c.failureCount
 }
 
 // escapeString экранирует спецсимволы для Manticore

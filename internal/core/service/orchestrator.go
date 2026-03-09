@@ -51,6 +51,21 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 	log.Println("Starting processing...")
 	o.startTime = time.Now()
 
+	// Добавим горутину для вывода статистики каждые 5 секунд
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				o.printStats()
+			}
+		}
+	}()
+
 	recordsChan, errChan := o.source.ReadRecords(ctx)
 
 	// Создаем дочерний контекст для воркеров
@@ -294,4 +309,22 @@ func (o *Orchestrator) Close() error {
 		return err
 	}
 	return o.writer.Close()
+}
+
+// printStats выводит текущую статистику
+func (o *Orchestrator) printStats() {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	writerStats := o.writer.GetStats()
+
+	// Если у клиента есть метод GetStats, вызываем его
+	if repo, ok := o.repo.(interface{ GetStats() (int64, int64) }); ok {
+		success, failure := repo.GetStats()
+		log.Printf("STATS: processed=%d, skipped=%d, written=%d, manticore_success=%d, manticore_failure=%d",
+			o.processed, o.skipped, writerStats.RecordsWritten, success, failure)
+	} else {
+		log.Printf("STATS: processed=%d, skipped=%d, written=%d",
+			o.processed, o.skipped, writerStats.RecordsWritten)
+	}
 }
