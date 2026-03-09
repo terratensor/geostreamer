@@ -30,6 +30,7 @@ type CSVReader struct {
 	skippedLines  int64
 	strictMode    bool
 	debugMode     bool
+	headerRead    bool // true если заголовок был прочитан в этом запуске
 }
 
 // NewCSVReader создает новый CSVReader
@@ -132,6 +133,13 @@ func (r *CSVReader) init() error {
 		}
 		r.currentLine++
 		r.currentOffset, _ = r.file.Seek(0, io.SeekCurrent)
+		r.headerRead = true // ← устанавливаем флаг
+		if r.debugMode {
+			log.Println("Header read successfully")
+		}
+	} else {
+		// При возобновлении с чекпоинта заголовок не читаем
+		r.headerRead = false
 	}
 
 	log.Printf("Starting from line %d (offset: %d)", r.currentLine+1, r.currentOffset)
@@ -174,8 +182,15 @@ func (r *CSVReader) ReadRecords(ctx context.Context) (<-chan []domain.CSVRecord,
 						errChan <- fmt.Errorf("failed to save final checkpoint: %w", err)
 					}
 
+					// Вычисляем количество записей данных (исключая заголовок)
+					totalDataRecords := r.currentLine
+					if r.headerRead {
+						// Если заголовок был прочитан в этом запуске, вычитаем его
+						totalDataRecords--
+					}
+
 					log.Printf("Finished processing. Total records: %d, Skipped lines: %d\n",
-						r.currentLine, r.skippedLines)
+						totalDataRecords, r.skippedLines)
 					return
 				}
 
