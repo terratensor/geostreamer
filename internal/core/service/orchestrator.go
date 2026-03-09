@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/terratensor/geostreamer/internal/adapters/repositories"
 	"github.com/terratensor/geostreamer/internal/adapters/writers"
 	"github.com/terratensor/geostreamer/internal/core/domain"
 	"github.com/terratensor/geostreamer/internal/ports/input"
@@ -355,20 +356,26 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []s
 
 	workerLog := o.log.WithPrefix(fmt.Sprintf("Worker-%d", workerID))
 
-	// Фильтруем только нужные типы сущностей
+	// Фильтруем по типу
 	filteredTexts := make([]string, 0)
 	filteredRecords := make(map[string]domain.CSVRecord)
 
 	for text, record := range records {
-		// Проверяем тип сущности
 		if len(o.entityTypes) > 0 {
 			if !o.entityTypes[record.EntityType] {
-				// Пропускаем ненужный тип - увеличиваем filtered, НЕ skipped
 				o.mu.Lock()
 				o.filtered++
 				o.mu.Unlock()
 
-				// НЕ пишем в skipped файл для отфильтрованных типов
+				if o.debugWriter != nil {
+					skipped := &domain.SkippedRecord{
+						Timestamp: time.Now(),
+						CSVRecord: record,
+						Reason:    "filtered_by_type",
+						WorkerID:  workerID,
+					}
+					o.debugWriter.WriteSkipped(skipped)
+				}
 				continue
 			}
 		}
@@ -380,94 +387,146 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int, texts []s
 		return
 	}
 
-	// Проверяем, поддерживает ли репозиторий вызов с workerID
-	var hitsMap map[string][]domain.GeoHit
-	var err error
-
-	if repoWithWorker, ok := o.repo.(interface {
-		FindBatchWithWorker(ctx context.Context, entityTexts []string, workerID int) (map[string][]domain.GeoHit, error)
+	// Используем расширенный интерфейс если доступен
+	if repoDebug, ok := o.repo.(interface {
+		FindBatchWithInfo(ctx context.Context, entityTexts []string, workerID int) (map[string][]domain.GeoHit, map[string]*repositories.QueryInfo, error)
 	}); ok {
-		hitsMap, err = repoWithWorker.FindBatchWithWorker(ctx, filteredTexts, workerID)
-	} else {
-		// Fallback для совместимости
-		hitsMap, err = o.repo.FindBatch(ctx, filteredTexts)
-	}
 
-	if err != nil {
-		workerLog.Error("Batch query failed: %v", err)
-		o.mu.Lock()
-		o.skipped += int64(len(filteredTexts))
-		o.mu.Unlock()
+		hitsMap, infoMap, err := repoDebug.FindBatchWithInfo(ctx, filteredTexts, workerID)
+
+		if err != nil {
+			workerLog.Error("Batch query failed: %v", err)
+			o.mu.Lock()
+			o.skipped += int64(len(filteredTexts))
+			o.mu.Unlock()
+
+			// Записываем информацию о каждой ошибке
+			for text, info := range infoMap {
+				if record, exists := filteredRecords[text]; exists {
+					o.writeSkippedFromInfo(record, info, "query_error")
+				}
+			}
+			return
+		}
+
+		// Обрабатываем найденные
+		for text, hits := range hitsMap {
+			record := filteredRecords[text]
+			info := infoMap[text]
+
+			if len(hits) == 0 {
+				o.mu.Lock()
+				o.skipped++
+				o.mu.Unlock()
+				o.writeSkippedFromInfo(record, info, "not_found_in_manticore")
+				continue
+			}
+
+			result := domain.NewGeoResult(record.DocID)
+			hasGeohashes := false
+
+			for _, hit := range hits {
+				strings, uints := hit.ToGeoResult()
+				if len(strings) > 0 || len(uints) > 0 {
+					hasGeohashes = true
+					for _, s := range strings {
+						result.GeohashesStringMap[s] = struct{}{}
+					}
+					for _, u := range uints {
+						result.GeohashesUint64Map[u] = struct{}{}
+					}
+				}
+			}
+
+			if hasGeohashes {
+				resultsChan <- result
+				o.mu.Lock()
+				o.processed++
+				o.mu.Unlock()
+			} else {
+				o.mu.Lock()
+				o.skipped++
+				o.mu.Unlock()
+				o.writeSkippedFromInfo(record, info, "hit_without_geohashes")
+			}
+		}
+	} else {
+		// Fallback для старого интерфейса
+		hitsMap, err := o.repo.FindBatch(ctx, filteredTexts)
+		if err != nil {
+			workerLog.Error("Batch query failed: %v", err)
+			o.mu.Lock()
+			o.skipped += int64(len(filteredTexts))
+			o.mu.Unlock()
+			return
+		}
+
+		// Простая обработка без детальной информации
+		for text, hits := range hitsMap {
+			record := filteredRecords[text]
+			result := domain.NewGeoResult(record.DocID)
+
+			for _, hit := range hits {
+				strings, uints := hit.ToGeoResult()
+				for _, s := range strings {
+					result.GeohashesStringMap[s] = struct{}{}
+				}
+				for _, u := range uints {
+					result.GeohashesUint64Map[u] = struct{}{}
+				}
+			}
+
+			if len(result.GeohashesStringMap) > 0 || len(result.GeohashesUint64Map) > 0 {
+				resultsChan <- result
+				o.mu.Lock()
+				o.processed++
+				o.mu.Unlock()
+			} else {
+				o.mu.Lock()
+				o.skipped++
+				o.mu.Unlock()
+			}
+		}
+	}
+}
+
+// writeSkippedFromInfo записывает skipped запись из информации о запросе
+func (o *Orchestrator) writeSkippedFromInfo(record domain.CSVRecord, info *repositories.QueryInfo, reason string) {
+	if o.debugWriter == nil || info == nil {
 		return
 	}
 
-	// Обрабатываем результаты
-	found := 0
-	for text, hits := range hitsMap {
-		record, ok := filteredRecords[text]
-		if !ok {
-			continue
-		}
-
-		result := domain.NewGeoResult(record.DocID)
-
-		for _, hit := range hits {
-			strings, uints := hit.ToGeoResult()
-			for _, s := range strings {
-				result.GeohashesStringMap[s] = struct{}{}
-			}
-			for _, u := range uints {
-				result.GeohashesUint64Map[u] = struct{}{}
-			}
-		}
-
-		if len(result.GeohashesStringMap) > 0 || len(result.GeohashesUint64Map) > 0 {
-			resultsChan <- result
-			o.mu.Lock()
-			o.processed++
-			found++
-			o.mu.Unlock()
-		} else {
-			// Не найдено в Manticore - это skipped для выбранного типа
-			o.mu.Lock()
-			o.skipped++
-			o.mu.Unlock()
-
-			// Пишем в skipped файл только для выбранных типов
-			if o.debugWriter != nil {
-				skipped := &domain.SkippedRecord{
-					Timestamp: time.Now(),
-					CSVRecord: record,
-					Reason:    "not_found_in_manticore",
-					WorkerID:  workerID,
-				}
-				o.debugWriter.WriteSkipped(skipped)
-			}
-		}
+	queryInfo := &domain.QueryDebugInfo{
+		Text:      info.Text,
+		Query:     info.Query,
+		Attempts:  info.Attempts,
+		WorkerID:  info.WorkerID,
+		Duration:  info.Duration,
+		Timestamp: info.Timestamp,
+		HitCount:  len(info.Hits),
+		Cached:    info.Cached,
+		Response:  info.Response,
 	}
 
-	// Пропущенные (не найденные в hitsMap) тексты для выбранных типов
-	notFound := len(filteredRecords) - len(hitsMap)
-	if notFound > 0 {
-		o.mu.Lock()
-		o.skipped += int64(notFound)
-		o.mu.Unlock()
-
-		// Для каждого не найденного текста пишем в skipped
-		if o.debugWriter != nil {
-			for text, record := range filteredRecords {
-				if _, exists := hitsMap[text]; !exists {
-					skipped := &domain.SkippedRecord{
-						Timestamp: time.Now(),
-						CSVRecord: record,
-						Reason:    "not_found_in_manticore",
-						WorkerID:  workerID,
-					}
-					o.debugWriter.WriteSkipped(skipped)
-				}
-			}
-		}
+	if info.Error != nil {
+		queryInfo.Error = info.Error.Error()
 	}
+	if info.HTTPStatus != "" {
+		queryInfo.HTTPStatus = info.HTTPStatus
+	}
+	if info.HTTPBody != "" {
+		queryInfo.HTTPBody = info.HTTPBody
+	}
+
+	skipped := &domain.SkippedRecord{
+		Timestamp: time.Now(),
+		CSVRecord: record,
+		Reason:    reason,
+		QueryInfo: queryInfo,
+		WorkerID:  info.WorkerID,
+	}
+
+	o.debugWriter.WriteSkipped(skipped)
 }
 
 // processHits обрабатывает результаты запросов

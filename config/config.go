@@ -75,7 +75,7 @@ func Load() *Config {
 	flag.IntVar(&cfg.Manticore.BatchSize, "manticore-batch", 100, "Manticore batch query size")
 	flag.IntVar(&cfg.Manticore.Workers, "manticore-workers", 10, "Number of parallel Manticore workers")
 	flag.BoolVar(&cfg.Manticore.DebugMode, "manticore-debug", false, "Manticore client debug mode")
-	flag.IntVar(&cfg.Manticore.ParallelQueries, "manticore-parallel", 5, "Number of parallel queries per batch")
+	flag.IntVar(&cfg.Manticore.ParallelQueries, "manticore-parallel", 20, "Number of parallel queries per batch")
 
 	// Output flags
 	flag.StringVar(&cfg.Output.Path, "output", "results.ndjson", "Path to output NDJSON file")

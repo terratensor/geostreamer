@@ -140,6 +140,7 @@ func (l *Logger) Error(format string, args ...interface{}) {
 type Stats struct {
 	ProcessedRecords int64
 	SkippedRecords   int64
+	FilteredRecords  int64
 	WrittenRecords   int64
 	ManticoreSuccess int64
 	ManticoreFailure int64
