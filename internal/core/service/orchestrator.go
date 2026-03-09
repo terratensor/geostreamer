@@ -92,21 +92,20 @@ func (o *Orchestrator) Process(ctx context.Context) error {
 		go o.worker(workerCtx, i, recordsChan, resultsChan, &wg)
 	}
 
-	// Канал для сигнала о завершении всех воркеров
-	done := make(chan struct{})
+	// Закрываем resultsChan после завершения всех воркеров
 	go func() {
 		wg.Wait()
-		close(done)
+		close(resultsChan)
 	}()
 
 	// Аккумулируем и записываем результаты
 	resultErr := o.processResults(ctx, resultsChan)
 
-	// Ждем завершения воркеров
-	<-done
+	// Ждем завершения воркеров (хотя они уже должны быть завершены)
+	wg.Wait()
 	o.log.Info("All workers completed")
 
-	// ОСТАНАВЛИВАЕМ ТАЙМЕР СТАТИСТИКИ
+	// ОСТАНАВЛИВАЕМ ТАЙМЕР СТАТИСТИКИ - ВОТ ЭТО ВАЖНО!
 	o.statsTicker.Stop()
 
 	// Проверяем ошибки
@@ -135,7 +134,6 @@ func (o *Orchestrator) statsReporter(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			o.statsTicker.Stop()
-			o.log.Debug("Stats reporter stopped")
 			return
 		case <-o.statsTicker.C:
 			o.printStats()
@@ -310,6 +308,7 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 	resultsChan chan<- *domain.GeoResult, wg *sync.WaitGroup) {
 
 	defer wg.Done()
+	defer fmt.Printf(">>> DEBUG: Worker %d defer Done called\n", id)
 
 	workerLog := o.log.WithPrefix(fmt.Sprintf("Worker-%d", id))
 
