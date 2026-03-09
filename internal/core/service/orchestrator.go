@@ -236,17 +236,14 @@ func (o *Orchestrator) processResults(ctx context.Context, resultsChan <-chan *d
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println(">>> DEBUG: processResults received ctx.Done()")
 			return ctx.Err()
 		case result, ok := <-resultsChan:
 			if !ok {
-				fmt.Println(">>> DEBUG: resultsChan closed, processing final batch")
 				if len(batch) > 0 {
 					if err := o.writer.WriteBatch(ctx, batch); err != nil {
 						return err
 					}
 				}
-				fmt.Println(">>> DEBUG: processResults exiting")
 				return nil
 			}
 
@@ -308,7 +305,6 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 	resultsChan chan<- *domain.GeoResult, wg *sync.WaitGroup) {
 
 	defer wg.Done()
-	defer fmt.Printf(">>> DEBUG: Worker %d defer Done called\n", id)
 
 	workerLog := o.log.WithPrefix(fmt.Sprintf("Worker-%d", id))
 
@@ -325,12 +321,9 @@ func (o *Orchestrator) worker(ctx context.Context, id int, recordsChan <-chan do
 			return
 		case record, ok := <-recordsChan:
 			if !ok {
-				fmt.Printf(">>> DEBUG: Worker %d received closed channel, processing %d remaining texts\n",
-					id, len(batch))
 				if len(batch) > 0 {
 					o.processBatch(context.Background(), id, batch, batchMap, resultsChan)
 				}
-				fmt.Printf(">>> DEBUG: Worker %d exiting\n", id)
 				return
 			}
 
