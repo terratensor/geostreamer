@@ -79,7 +79,7 @@ func main() {
 		writer,
 		cfg.Manticore.Workers,
 		cfg.Manticore.BatchSize,
-		1000, // сбрасывать после 1000 doc_id
+		10, // сбрасывать после 1000 doc_id
 	)
 
 	// Запускаем обработку
