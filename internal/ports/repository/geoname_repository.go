@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 
+	"github.com/terratensor/geostreamer/internal/adapters/writers"
 	"github.com/terratensor/geostreamer/internal/core/domain"
 )
 
@@ -16,4 +17,17 @@ type GeonameRepository interface {
 
 	// Close закрывает соединение с репозиторием
 	Close() error
+}
+
+// GeonameRepositoryWithDebug расширенный интерфейс для отладки
+type GeonameRepositoryWithDebug interface {
+	GeonameRepository
+	// FindBatchWithWorker выполняет поиск с указанием ID воркера
+	FindBatchWithWorker(ctx context.Context, entityTexts []string, workerID int) (map[string][]domain.GeoHit, error)
+
+	// SetDebugWriter устанавливает writer для записи отладочной информации
+	SetDebugWriter(writer *writers.DebugWriter)
+
+	// GetStats возвращает статистику запросов
+	GetStats() (success, failure int64)
 }

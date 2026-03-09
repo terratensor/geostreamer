@@ -10,6 +10,7 @@ import (
 	"github.com/terratensor/geostreamer/internal/adapters/repositories"
 	"github.com/terratensor/geostreamer/internal/adapters/writers"
 	"github.com/terratensor/geostreamer/internal/core/service"
+	"github.com/terratensor/geostreamer/internal/ports/repository"
 	"github.com/terratensor/geostreamer/pkg/logger"
 )
 
@@ -68,16 +69,20 @@ func main() {
 		ParallelQueries: cfg.Manticore.ParallelQueries,
 	}
 
-	repo, err := repositories.NewManticoreClient(manticoreCfg)
+	manticoreClient, err := repositories.NewManticoreClient(manticoreCfg)
 	if err != nil {
 		log.Error("Failed to create Manticore client: %v", err)
 		return
 	}
-	defer repo.Close()
+	defer manticoreClient.Close()
 
-	// Передаем debugWriter в Manticore клиент если он поддерживает
-	if repoWithDebug, ok := repo.(interface{ SetDebugWriter(*writers.DebugWriter) }); ok {
+	// Приводим к интерфейсу для использования в оркестраторе
+	var repo repository.GeonameRepository = manticoreClient
+
+	// Если поддерживается расширенный интерфейс, устанавливаем debugWriter
+	if repoWithDebug, ok := repo.(repository.GeonameRepositoryWithDebug); ok {
 		repoWithDebug.SetDebugWriter(debugWriter)
+		log.Info("Debug writer attached to Manticore client")
 	}
 
 	// Создаем NDJSON writer

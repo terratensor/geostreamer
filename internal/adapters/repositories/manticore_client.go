@@ -99,7 +99,7 @@ type FailedQueryInfo struct {
 	WorkerID   int
 }
 
-// ManticoreClient с поддержкой сбора ошибок
+// ManticoreClient реализует интерфейс GeonameRepositoryWithDebug
 type ManticoreClient struct {
 	apiClient    *Manticoresearch.APIClient
 	indexName    string
@@ -108,14 +108,27 @@ type ManticoreClient struct {
 	requestPool  *sync.Pool
 	successCount int64
 	failureCount int64
-	failures     []FailedQueryInfo // для сбора деталей
+	failures     []FailedQueryInfo
 	mu           sync.RWMutex
-	debugWriter  *writers.DebugWriter // опционально
+	debugWriter  *writers.DebugWriter
 }
 
-// SetDebugWriter устанавливает writer для отладки
-func (c *ManticoreClient) SetDebugWriter(w *writers.DebugWriter) {
-	c.debugWriter = w
+// SetDebugWriter implements GeonameRepositoryWithDebug
+func (c *ManticoreClient) SetDebugWriter(writer *writers.DebugWriter) {
+	c.debugWriter = writer
+}
+
+// GetStats implements GeonameRepositoryWithDebug
+func (c *ManticoreClient) GetStats() (success, failure int64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.successCount, c.failureCount
+}
+
+// FindBatch implements GeonameRepository
+func (c *ManticoreClient) FindBatch(ctx context.Context, entityTexts []string) (map[string][]domain.GeoHit, error) {
+	// Для обратной совместимости вызываем с workerID = -1
+	return c.FindBatchWithWorker(ctx, entityTexts, -1)
 }
 
 // NewManticoreClient создает новый клиент Manticore
@@ -167,8 +180,98 @@ func NewManticoreClient(cfg Config) (*ManticoreClient, error) {
 	}, nil
 }
 
-// FindBatch выполняет поиск нескольких сущностей
-func (c *ManticoreClient) FindBatch(ctx context.Context, entityTexts []string) (map[string][]domain.GeoHit, error) {
+// executeBatchQuery с передачей workerID
+func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string, workerID int) ([]domain.GeoHit, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+
+	if c.config.DebugMode {
+		log.Printf("Worker %d: Processing %d individual queries for batch", workerID, len(texts))
+	}
+
+	// Создаем канал для результатов
+	type queryResult struct {
+		text string
+		hits []domain.GeoHit
+		err  error
+	}
+
+	resultChan := make(chan queryResult, len(texts))
+
+	// Создаем отдельный контекст для этого батча
+	batchCtx, batchCancel := context.WithTimeout(context.Background(), c.config.Timeout)
+	defer batchCancel()
+
+	var wg sync.WaitGroup
+
+	// Ограничиваем параллелизм
+	semaphore := make(chan struct{}, c.config.ParallelQueries)
+
+	for _, text := range texts {
+		wg.Add(1)
+		go func(searchText string, workerID int) {
+			defer wg.Done()
+
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-batchCtx.Done():
+				resultChan <- queryResult{
+					text: searchText,
+					err:  batchCtx.Err(),
+				}
+				return
+			}
+
+			// Передаем workerID в executeSingleQuery
+			hits, err := c.executeSingleQuery(batchCtx, searchText, workerID)
+
+			select {
+			case resultChan <- queryResult{
+				text: searchText,
+				hits: hits,
+				err:  err,
+			}:
+			case <-batchCtx.Done():
+				// Контекст отменен, не отправляем результат
+			}
+		}(text, workerID)
+	}
+
+	// Закрываем канал после завершения всех горутин
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Собираем результаты с таймаутом
+	var allHits []domain.GeoHit
+	for {
+		select {
+		case result, ok := <-resultChan:
+			if !ok {
+				return allHits, nil
+			}
+			if result.err != nil {
+				if c.config.DebugMode && !errors.Is(result.err, context.DeadlineExceeded) {
+					log.Printf("Worker %d: Query for '%s' failed: %v", workerID, result.text, result.err)
+				}
+				continue
+			}
+			allHits = append(allHits, result.hits...)
+		case <-time.After(c.config.Timeout):
+			if c.config.DebugMode {
+				log.Printf("Worker %d: Batch timeout after %v, returning %d results",
+					workerID, c.config.Timeout, len(allHits))
+			}
+			return allHits, nil
+		}
+	}
+}
+
+// FindBatchWithWorker implements GeonameRepositoryWithDebug
+func (c *ManticoreClient) FindBatchWithWorker(ctx context.Context, entityTexts []string, workerID int) (map[string][]domain.GeoHit, error) {
 	result := make(map[string][]domain.GeoHit)
 
 	// Разделяем на кэшированные и некэшированные запросы
@@ -188,8 +291,8 @@ func (c *ManticoreClient) FindBatch(ctx context.Context, entityTexts []string) (
 		return result, nil
 	}
 
-	// Выполняем запросы для некэшированных текстов
-	hits, err := c.executeBatchQuery(ctx, uncached)
+	// Выполняем запросы для некэшированных текстов с workerID
+	hits, err := c.executeBatchQuery(ctx, uncached, workerID)
 	if err != nil {
 		return nil, fmt.Errorf("batch query failed: %w", err)
 	}
@@ -209,105 +312,13 @@ func (c *ManticoreClient) FindBatch(ctx context.Context, entityTexts []string) (
 	return result, nil
 }
 
-// executeBatchQuery выполняет групповой запрос к Manticore
-func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string) ([]domain.GeoHit, error) {
-	if len(texts) == 0 {
-		return nil, nil
-	}
-
-	// НЕ проверяем ctx.Done() здесь - даем шанс выполниться
-
-	if c.config.DebugMode {
-		log.Printf("Processing %d individual queries for batch", len(texts))
-	}
-
-	// Создаем канал для результатов
-	type queryResult struct {
-		text string
-		hits []domain.GeoHit
-		err  error
-	}
-
-	resultChan := make(chan queryResult, len(texts))
-
-	// Создаем отдельный контекст для этого батча, который НЕ отменяется при внешней отмене
-	// Но имеет таймаут
-	batchCtx, batchCancel := context.WithTimeout(context.Background(), c.config.Timeout)
-	defer batchCancel()
-
-	var wg sync.WaitGroup
-
-	// Ограничиваем параллелизм
-	semaphore := make(chan struct{}, c.config.ParallelQueries)
-
-	for _, text := range texts {
-		wg.Add(1)
-		go func(searchText string) {
-			defer wg.Done()
-
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-batchCtx.Done():
-				resultChan <- queryResult{
-					text: searchText,
-					err:  batchCtx.Err(),
-				}
-				return
-			}
-
-			// Используем batchCtx для запроса, а не родительский ctx
-			hits, err := c.executeSingleQuery(batchCtx, searchText)
-
-			select {
-			case resultChan <- queryResult{
-				text: searchText,
-				hits: hits,
-				err:  err,
-			}:
-			case <-batchCtx.Done():
-				// Контекст отменен, не отправляем результат
-			}
-		}(text)
-	}
-
-	// Закрываем канал после завершения всех горутин
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	// Собираем результаты с таймаутом
-	var allHits []domain.GeoHit
-	for {
-		select {
-		case result, ok := <-resultChan:
-			if !ok {
-				return allHits, nil
-			}
-			if result.err != nil {
-				if c.config.DebugMode && !errors.Is(result.err, context.DeadlineExceeded) {
-					log.Printf("Query for '%s' failed: %v", result.text, result.err)
-				}
-				continue
-			}
-			allHits = append(allHits, result.hits...)
-		case <-time.After(c.config.Timeout):
-			// Если долго нет результатов, возвращаем что есть
-			log.Printf("Batch timeout after %v, returning %d results",
-				c.config.Timeout, len(allHits))
-			return allHits, nil
-		}
-	}
-}
-
-// executeSingleQuery с детальным логированием ошибок
+// executeSingleQuery с workerID
 func (c *ManticoreClient) executeSingleQuery(ctx context.Context, text string, workerID int) ([]domain.GeoHit, error) {
 	escaped := c.escapeString(text)
 	query := fmt.Sprintf("SELECT * FROM %s WHERE match('\"^%s$\"')", c.indexName, escaped)
 
 	if c.config.DebugMode {
-		log.Printf("Single query for '%s': %s", text, query)
+		log.Printf("Worker %d: Single query for '%s': %s", workerID, text, query)
 	}
 
 	queryCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
@@ -402,13 +413,6 @@ func (c *ManticoreClient) GetFailures() []FailedQueryInfo {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return append([]FailedQueryInfo{}, c.failures...)
-}
-
-// Добавить метод для получения статистики
-func (c *ManticoreClient) GetStats() (success, failure int64) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.successCount, c.failureCount
 }
 
 // escapeString экранирует спецсимволы для Manticore
