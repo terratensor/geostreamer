@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -230,7 +231,6 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 		return nil, nil
 	}
 
-	// Проверяем, не отменен ли контекст перед началом
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -241,6 +241,7 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 	conditions := make([]string, len(texts))
 	for i, text := range texts {
 		escaped := c.escapeString(text)
+		// Используем точное совпадение с ^ и $
 		conditions[i] = fmt.Sprintf("match('\"^%s$\"')", escaped)
 	}
 
@@ -249,11 +250,14 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 		strings.Join(conditions, " OR "))
 
 	if c.config.DebugMode {
-		// Логируем только первые несколько условий, чтобы не засорять лог
-		if len(texts) > 5 {
-			log.Printf("Query with %d terms: %s ...", len(texts), query[:200])
+		// Логируем первые несколько условий
+		if len(texts) > 3 {
+			log.Printf("Query with %d terms (first 3): %v ...",
+				len(texts), texts[:3])
+			log.Printf("SQL: %s", query[:min(500, len(query))])
 		} else {
-			log.Printf("Query: %s", query)
+			log.Printf("Query terms: %v", texts)
+			log.Printf("SQL: %s", query)
 		}
 	}
 
@@ -277,7 +281,6 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 			}
 		}
 
-		// Создаем запрос с таймаутом
 		reqCtx, cancel := context.WithTimeout(ctx, c.config.Timeout)
 		defer cancel()
 
@@ -290,13 +293,19 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 			break
 		}
 
-		// Логируем детали ошибки
+		// Детальное логирование ошибки
 		if c.config.DebugMode {
 			log.Printf("Query attempt %d failed: %v", attempt+1, err)
 			if httpResp != nil {
 				body, _ := io.ReadAll(httpResp.Body)
-				log.Printf("HTTP Response status: %s, body: %s", httpResp.Status, string(body))
+				log.Printf("HTTP Status: %s", httpResp.Status)
+				log.Printf("HTTP Body: %s", string(body))
 				httpResp.Body.Close()
+
+				// Сохраняем проблемный запрос в файл для анализа
+				if attempt == c.config.MaxRetries {
+					c.saveFailedQuery(query, texts, httpResp.Status, string(body))
+				}
 			}
 		}
 
@@ -312,32 +321,58 @@ func (c *ManticoreClient) executeBatchQuery(ctx context.Context, texts []string)
 	return c.parseResponse(resp)
 }
 
-// escapeString экранирует спецсимволы для Manticore
+// saveFailedQuery сохраняет проблемный запрос в файл
+func (c *ManticoreClient) saveFailedQuery(query string, texts []string, status, body string) {
+	filename := fmt.Sprintf("failed_query_%d.log", time.Now().UnixNano())
+
+	content := fmt.Sprintf("Timestamp: %s\nStatus: %s\n\nTexts: %v\n\nQuery: %s\n\nResponse: %s\n",
+		time.Now().Format(time.RFC3339),
+		status,
+		texts,
+		query,
+		body,
+	)
+
+	if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
+		log.Printf("Failed to save failed query: %v", err)
+	} else {
+		log.Printf("Saved failed query to %s", filename)
+	}
+}
+
+// min вспомогательная функция
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// escapeString экранирует спецсимволы для Manticore согласно официальной документации
 func (c *ManticoreClient) escapeString(s string) string {
-	// Manticore требует экранирования следующих символов:
-	// \ ' " = ! ( ) | & ; : / - + * % $ # @ , . ? ~ < > { } [ ] ^
+	// Список символов, которые нужно экранировать согласно документации
+	// ! " $ ' ( ) - / < @ \ ^ | ~
 
-	// Сначала экранируем обратную косую черту
-	s = strings.ReplaceAll(s, `\`, `\\`)
+	var builder strings.Builder
+	builder.Grow(len(s) * 2) // Примерно с запасом
 
-	// Экранируем кавычки
-	s = strings.ReplaceAll(s, `"`, `\"`)
-
-	// Экранируем одинарные кавычки (хотя мы используем двойные, но на всякий случай)
-	s = strings.ReplaceAll(s, `'`, `\'`)
-
-	// Экранируем спецсимволы для regexp, если они есть в запросе
-	// В match мы используем точное совпадение с ^ и $, поэтому нужно экранировать и их
-	s = strings.ReplaceAll(s, `^`, `\^`)
-	s = strings.ReplaceAll(s, `$`, `\$`)
-
-	// Экранируем другие спецсимволы Manticore
-	special := []string{"=", "!", "(", ")", "|", "&", ";", ":", "/", "-", "+", "*", "%", "#", "@", ",", ".", "?", "~", "<", ">", "{", "}", "[", "]"}
-	for _, ch := range special {
-		s = strings.ReplaceAll(s, ch, `\`+ch)
+	for _, ch := range s {
+		switch ch {
+		case '!', '"', '$', '\'', '(', ')', '-', '/', '<', '@', '^', '|', '~':
+			// Эти символы экранируются одним обратным слешем
+			builder.WriteByte('\\')
+			builder.WriteRune(ch)
+		case '\\':
+			// Обратная косая черта требует 4 слеша в SQL
+			// Но так как мы формируем SQL запрос, а не JSON,
+			// используем двойное экранирование
+			builder.WriteString(`\\\\`)
+		default:
+			builder.WriteRune(ch)
+		}
 	}
 
-	return s
+	return builder.String()
 }
 
 // parseResponse парсит ответ от Manticore в структуры GeoHit
