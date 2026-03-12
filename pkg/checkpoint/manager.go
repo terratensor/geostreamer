@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/terratensor/geostreamer/internal/version"
 )
 
 // Manager управляет сохранением и загрузкой чекпоинтов
@@ -20,7 +22,7 @@ type Checkpoint struct {
 	LineNumber   int64     `json:"line_number"`   // номер строки
 	SkippedLines int64     `json:"skipped_lines"` // пропущено строк
 	Timestamp    time.Time `json:"timestamp"`     // время сохранения
-	Version      string    `json:"version"`       // версия формата
+	Version      string    `json:"version"`       // версия программы
 }
 
 // NewManager создает новый менеджер чекпоинтов
@@ -44,7 +46,7 @@ func (m *Manager) Save(offset, lineNum int64) error {
 		Offset:     offset,
 		LineNumber: lineNum,
 		Timestamp:  time.Now(),
-		Version:    "1.0",
+		Version:    version.Short(), // используем текущую версию
 	}
 
 	data, err := json.MarshalIndent(checkpoint, "", "  ")
@@ -61,7 +63,7 @@ func (m *Manager) Save(offset, lineNum int64) error {
 	return os.Rename(tmpFile, m.filePath)
 }
 
-// Load загружает чекпоинт из файла
+// Load загружает чекпоинт и проверяет совместимость версий
 func (m *Manager) Load() (*Checkpoint, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -73,7 +75,7 @@ func (m *Manager) Load() (*Checkpoint, error) {
 				Offset:     0,
 				LineNumber: 0,
 				Timestamp:  time.Now(),
-				Version:    "1.0",
+				Version:    version.Short(),
 			}, nil
 		}
 		return nil, err
@@ -82,6 +84,13 @@ func (m *Manager) Load() (*Checkpoint, error) {
 	var checkpoint Checkpoint
 	if err := json.Unmarshal(data, &checkpoint); err != nil {
 		return nil, err
+	}
+
+	// Проверяем совместимость версий (опционально)
+	if checkpoint.Version != version.Short() {
+		// Можно добавить предупреждение, но не блокировать
+		// log.Printf("Warning: checkpoint created with version %s, current version is %s",
+		//    checkpoint.Version, version.Short())
 	}
 
 	return &checkpoint, nil

@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -11,10 +14,25 @@ import (
 	"github.com/terratensor/geostreamer/internal/adapters/writers"
 	"github.com/terratensor/geostreamer/internal/core/service"
 	"github.com/terratensor/geostreamer/internal/ports/repository"
+	"github.com/terratensor/geostreamer/internal/version"
 	"github.com/terratensor/geostreamer/pkg/logger"
 )
 
+var (
+	// Флаг для вывода версии
+	showVersion = flag.Bool("version", false, "show version information and exit")
+)
+
 func main() {
+	// Сначала парсим флаги, чтобы перехватить -version
+	flag.Parse()
+
+	// Если запрошена версия, показываем и выходим
+	if *showVersion {
+		fmt.Println(version.Info())
+		os.Exit(0)
+	}
+
 	// Загружаем конфигурацию
 	cfg := config.Load()
 
@@ -24,6 +42,9 @@ func main() {
 		return
 	}
 	log := logger.Get()
+
+	// Логируем версию при запуске
+	log.Info("Starting %s", version.Info())
 
 	// Создаем контекст с отменой
 	ctx, cancel := signal.NotifyContext(context.Background(),

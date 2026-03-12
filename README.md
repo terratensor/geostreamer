@@ -39,6 +39,15 @@ doc_id|entity_type|entity_text|confidence|start_pos|end_pos
   -output-skipped skipped.ndjson
 ```
 
+### Версионирование
+
+Проект использует семантическое версионирование. Текущая версия: **1.0.0**
+
+Для просмотра версии:
+```bash
+./geostreamer -version
+# GeoStreamer 1.0.0 (commit: abc123, built: 2024-03-09_23:55:55)
+
 ## Параметры запуска
 
 ### Параметры CSV
