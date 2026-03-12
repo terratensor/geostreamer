@@ -24,16 +24,15 @@ var (
 )
 
 func main() {
-	// Сначала парсим флаги, чтобы перехватить -version
-	flag.Parse()
-
-	// Если запрошена версия, показываем и выходим
-	if *showVersion {
-		fmt.Println(version.Info())
-		os.Exit(0)
+	// Сначала проверяем, не запрошена ли версия (без регистрации флага)
+	for _, arg := range os.Args {
+		if arg == "-version" || arg == "--version" {
+			fmt.Println(version.Info())
+			os.Exit(0)
+		}
 	}
 
-	// Загружаем конфигурацию
+	// Загружаем конфигурацию (она переопределит флаги, но это нормально)
 	cfg := config.Load()
 
 	// Инициализируем логгер
@@ -53,12 +52,11 @@ func main() {
 
 	// Создаем CSV reader
 	delimRune := []rune(cfg.CSV.Delimiter)[0]
-	// Создаем CSV reader с новыми параметрами
 	source, err := readers.NewCSVReader(
 		cfg.CSV.Path,
 		delimRune,
-		cfg.CSV.BatchSize,    // максимальный размер батча (500-800)
-		cfg.CSV.MinBatchSize, // минимальный размер (100)
+		cfg.CSV.BatchSize,
+		cfg.CSV.MinBatchSize,
 		cfg.CSV.CheckpointPath,
 		cfg.CSV.StrictMode,
 		cfg.CSV.DebugMode,
@@ -108,7 +106,7 @@ func main() {
 		log.Info("Debug writer attached to Manticore client")
 	}
 
-	// Создаем NDJSON writer
+	// Создаем NDJSON writer для обычных результатов
 	writerCfg := writers.NDJSONWriterConfig{
 		FilePath:      cfg.Output.Path,
 		FlushInterval: cfg.Output.FlushInterval,
@@ -123,11 +121,29 @@ func main() {
 	}
 	defer writer.Close()
 
-	// Создаем оркестратор
+	// Создаем enriched writer если указан путь
+	var enrichedWriter *writers.EnrichedWriter
+	if cfg.Output.EnrichedPath != "" {
+		enrichedCfg := writers.EnrichedWriterConfig{
+			FilePath:      cfg.Output.EnrichedPath,
+			FlushInterval: cfg.Output.FlushInterval,
+			BufferSize:    cfg.Output.BufferSize,
+		}
+		enrichedWriter, err = writers.NewEnrichedWriter(enrichedCfg)
+		if err != nil {
+			log.Error("Failed to create enriched writer: %v", err)
+			return
+		}
+		defer enrichedWriter.Close()
+		log.Info("Enriched output enabled: %s", cfg.Output.EnrichedPath)
+	}
+
+	// Создаем оркестратор с поддержкой enriched
 	orch := service.NewOrchestrator(
 		source,
 		repo,
 		writer,
+		enrichedWriter,
 		debugWriter,
 		cfg.Manticore.Workers,
 		cfg.Manticore.BatchSize,
@@ -142,6 +158,9 @@ func main() {
 		log.Error("Processing failed: %v", err)
 	}
 
-	// Финальный сброс debugWriter
+	// Финальный сброс
 	debugWriter.Flush()
+	if enrichedWriter != nil {
+		enrichedWriter.Flush()
+	}
 }

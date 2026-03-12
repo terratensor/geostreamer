@@ -18,22 +18,23 @@ import (
 
 // Orchestrator управляет всем пайплайном обработки
 type Orchestrator struct {
-	source      input.RecordSource
-	repo        repository.GeonameRepository
-	writer      output.ResultWriter
-	debugWriter *writers.DebugWriter
-	workers     int
-	batchSize   int // количество строк в батче
-	results     map[string]*domain.GeoResult
-	mu          sync.RWMutex
-	processed   int64 // строки LOC, для которых найдены геохеши
-	skipped     int64 // строки LOC, не найденные в Manticore
-	filtered    int64 // строки PER/ORG, отфильтрованные по типу
-	startTime   time.Time
-	flushCount  int // количество doc_id для сброса
-	log         *logger.Logger
-	statsTicker *time.Ticker
-	entityTypes map[string]bool
+	source         input.RecordSource
+	repo           repository.GeonameRepository
+	writer         output.ResultWriter
+	enrichedWriter *writers.EnrichedWriter // опциональный enriched writer
+	debugWriter    *writers.DebugWriter
+	workers        int
+	batchSize      int // количество строк в батче
+	results        map[string]*domain.GeoResult
+	mu             sync.RWMutex
+	processed      int64 // строки LOC, для которых найдены геохеши
+	skipped        int64 // строки LOC, не найденные в Manticore
+	filtered       int64 // строки PER/ORG, отфильтрованные по типу
+	startTime      time.Time
+	flushCount     int // количество doc_id для сброса
+	log            *logger.Logger
+	statsTicker    *time.Ticker
+	entityTypes    map[string]bool
 }
 
 // NewOrchestrator создает новый оркестратор
@@ -41,6 +42,7 @@ func NewOrchestrator(
 	source input.RecordSource,
 	repo repository.GeonameRepository,
 	writer output.ResultWriter,
+	enrichedWriter *writers.EnrichedWriter, // может быть nil
 	debugWriter *writers.DebugWriter,
 	workers, batchSize, flushCount int,
 	statsInterval time.Duration,
@@ -53,17 +55,18 @@ func NewOrchestrator(
 	}
 
 	return &Orchestrator{
-		source:      source,
-		repo:        repo,
-		writer:      writer,
-		debugWriter: debugWriter,
-		workers:     workers,
-		batchSize:   batchSize,
-		flushCount:  flushCount,
-		results:     make(map[string]*domain.GeoResult),
-		log:         logger.Get().WithPrefix("Orchestrator"),
-		statsTicker: time.NewTicker(statsInterval),
-		entityTypes: typeMap,
+		source:         source,
+		repo:           repo,
+		writer:         writer,
+		debugWriter:    debugWriter,
+		enrichedWriter: enrichedWriter,
+		workers:        workers,
+		batchSize:      batchSize,
+		flushCount:     flushCount,
+		results:        make(map[string]*domain.GeoResult),
+		log:            logger.Get().WithPrefix("Orchestrator"),
+		statsTicker:    time.NewTicker(statsInterval),
+		entityTypes:    typeMap,
 	}
 }
 
@@ -320,20 +323,51 @@ func (o *Orchestrator) processDocRecords(ctx context.Context, workerID int,
 	hasGeohashes := false
 	result := domain.NewGeoResult(docID)
 
+	// Для enriched сбора
+	var enrichedNerLOC []domain.NEREntity
+	var enrichedNerPER []domain.NEREntity
+	var enrichedNerORG []domain.NEREntity
+
 	// Для записей с hits проверяем наличие геохешей
 	for _, rec := range recordsWithHits {
 		hits := hitsMap[rec.EntityText]
+		var recordGeohashes []string
+		recordHasGeo := false
+
 		for _, hit := range hits {
 			strs, uints := hit.ToGeoResult()
 			if len(strs) > 0 || len(uints) > 0 {
+				recordHasGeo = true
 				hasGeohashes = true
-				// Добавляем все геохеши в результат
+				recordGeohashes = append(recordGeohashes, strs...)
+
+				// Добавляем все геохеши в основной результат
 				for _, s := range strs {
 					result.GeohashesStringMap[s] = struct{}{}
 				}
 				for _, u := range uints {
 					result.GeohashesUint64Map[u] = struct{}{}
 				}
+			}
+		}
+
+		// Если есть enriched writer и запись имеет геохеши, собираем NER-информацию
+		if o.enrichedWriter != nil && recordHasGeo {
+			nerEntity := domain.NEREntity{
+				Value:      rec.EntityText,
+				StartPos:   rec.StartPos,
+				EndPos:     rec.EndPos,
+				Geohash:    recordGeohashes,
+				Confidence: rec.Confidence,
+			}
+
+			switch rec.EntityType {
+			case "LOC":
+				enrichedNerLOC = append(enrichedNerLOC, nerEntity)
+			case "PER":
+				enrichedNerPER = append(enrichedNerPER, nerEntity)
+			case "ORG":
+				enrichedNerORG = append(enrichedNerORG, nerEntity)
 			}
 		}
 	}
@@ -346,9 +380,30 @@ func (o *Orchestrator) processDocRecords(ctx context.Context, workerID int,
 		o.skipped += int64(len(recordsWithoutHits))
 		o.mu.Unlock()
 
-		// Отправляем результат, только если есть геохеши
+		// Отправляем обычный результат
 		if len(result.GeohashesStringMap) > 0 || len(result.GeohashesUint64Map) > 0 {
 			resultsChan <- result
+		}
+
+		// Если есть enriched writer, формируем и отправляем enriched результат
+		if o.enrichedWriter != nil && (len(enrichedNerLOC) > 0 || len(enrichedNerPER) > 0 || len(enrichedNerORG) > 0) {
+			geoOutput := result.ToOutput()
+			enrichedResult := &domain.EnrichedGeoOutput{
+				DocID:           geoOutput.DocID,
+				GeohashesString: geoOutput.GeohashesString,
+				GeohashesUint64: geoOutput.GeohashesUint64,
+				NerLOC:          enrichedNerLOC,
+				NerPER:          enrichedNerPER,
+				NerORG:          enrichedNerORG,
+			}
+
+			// Отправляем enriched результат (в отдельной горутине чтобы не блокировать)
+			go func() {
+				batch := []domain.EnrichedGeoOutput{*enrichedResult}
+				if err := o.enrichedWriter.WriteBatch(ctx, batch); err != nil {
+					o.log.Error("Failed to write enriched result for doc_id %s: %v", docID, err)
+				}
+			}()
 		}
 	} else {
 		// Нет геохешей - все записи идут в skipped

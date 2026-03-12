@@ -35,6 +35,7 @@ type Config struct {
 
 	Output struct {
 		Path          string
+		EnrichedPath  string // новый параметр
 		FlushInterval time.Duration
 		BufferSize    int
 		UseGzip       bool
@@ -86,6 +87,8 @@ func Load() *Config {
 	flag.IntVar(&cfg.Output.BufferSize, "output-buffer", 1024*1024, "Output buffer size in bytes")
 	flag.BoolVar(&cfg.Output.UseGzip, "output-gzip", false, "Compress output file with gzip")
 	flag.BoolVar(&cfg.Output.PrettyPrint, "output-pretty", false, "Pretty print JSON (slower, larger files)")
+	flag.StringVar(&cfg.Output.EnrichedPath, "output-enriched", "",
+		"Path to enriched NDJSON file with NER details (if empty, uses regular output)")
 
 	// Logging flags
 	flag.StringVar(&cfg.Logging.Level, "log-level", "info", "Log level (debug, info, warn, error)")
