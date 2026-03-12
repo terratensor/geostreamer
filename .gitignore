@@ -26,3 +26,5 @@
 
 # Checkpoint files
 *.checkpoint
+
+data/
