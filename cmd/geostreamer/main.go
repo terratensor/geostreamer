@@ -24,13 +24,12 @@ var (
 )
 
 func main() {
-	// Сначала парсим флаги, чтобы перехватить -version
-	flag.Parse()
-
-	// Если запрошена версия, показываем и выходим
-	if *showVersion {
-		fmt.Println(version.Info())
-		os.Exit(0)
+	// Сначала проверяем, не запрошена ли версия (без регистрации флага)
+	for _, arg := range os.Args {
+		if arg == "-version" || arg == "--version" {
+			fmt.Println(version.Info())
+			os.Exit(0)
+		}
 	}
 
 	// Загружаем конфигурацию
