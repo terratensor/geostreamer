@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -13,14 +12,10 @@ import (
 	"github.com/terratensor/geostreamer/internal/adapters/repositories"
 	"github.com/terratensor/geostreamer/internal/adapters/writers"
 	"github.com/terratensor/geostreamer/internal/core/service"
+	"github.com/terratensor/geostreamer/internal/ports/output"
 	"github.com/terratensor/geostreamer/internal/ports/repository"
 	"github.com/terratensor/geostreamer/internal/version"
 	"github.com/terratensor/geostreamer/pkg/logger"
-)
-
-var (
-	// Флаг для вывода версии
-	showVersion = flag.Bool("version", false, "show version information and exit")
 )
 
 func main() {
@@ -52,12 +47,11 @@ func main() {
 
 	// Создаем CSV reader
 	delimRune := []rune(cfg.CSV.Delimiter)[0]
-	// Создаем CSV reader с новыми параметрами
 	source, err := readers.NewCSVReader(
 		cfg.CSV.Path,
 		delimRune,
-		cfg.CSV.BatchSize,    // максимальный размер батча (500-800)
-		cfg.CSV.MinBatchSize, // минимальный размер (100)
+		cfg.CSV.BatchSize,
+		cfg.CSV.MinBatchSize,
 		cfg.CSV.CheckpointPath,
 		cfg.CSV.StrictMode,
 		cfg.CSV.DebugMode,
@@ -107,26 +101,65 @@ func main() {
 		log.Info("Debug writer attached to Manticore client")
 	}
 
-	// Создаем NDJSON writer
-	writerCfg := writers.NDJSONWriterConfig{
-		FilePath:      cfg.Output.Path,
-		FlushInterval: cfg.Output.FlushInterval,
-		BufferSize:    cfg.Output.BufferSize,
-		UseGzip:       cfg.Output.UseGzip,
+	// Режим 1: Создаем NDJSON writer для обычных результатов (геохеши)
+	var writer output.ResultWriter
+	if cfg.Output.Path != "" {
+		writerCfg := writers.NDJSONWriterConfig{
+			FilePath:      cfg.Output.Path,
+			FlushInterval: cfg.Output.FlushInterval,
+			BufferSize:    cfg.Output.BufferSize,
+			UseGzip:       cfg.Output.UseGzip,
+		}
+		writer, err = writers.NewNDJSONWriter(writerCfg)
+		if err != nil {
+			log.Error("Failed to create output writer: %v", err)
+			return
+		}
+		defer writer.Close()
+		log.Info("Output (geohashes only) enabled: %s", cfg.Output.Path)
 	}
 
-	writer, err := writers.NewNDJSONWriter(writerCfg)
-	if err != nil {
-		log.Error("Failed to create output writer: %v", err)
-		return
+	// Режим 2: Создаем NER-only writer если указан путь
+	var nerWriter *writers.NerWriter
+	if cfg.Output.NerPath != "" {
+		nerCfg := writers.NerWriterConfig{
+			FilePath:      cfg.Output.NerPath,
+			FlushInterval: cfg.Output.FlushInterval,
+			BufferSize:    cfg.Output.BufferSize,
+		}
+		nerWriter, err = writers.NewNerWriter(nerCfg)
+		if err != nil {
+			log.Error("Failed to create NER writer: %v", err)
+			return
+		}
+		defer nerWriter.Close()
+		log.Info("NER-only output enabled: %s", cfg.Output.NerPath)
 	}
-	defer writer.Close()
 
-	// Создаем оркестратор
+	// Режим 3: Создаем enriched writer если указан путь
+	var enrichedWriter *writers.EnrichedWriter
+	if cfg.Output.EnrichedPath != "" {
+		enrichedCfg := writers.EnrichedWriterConfig{
+			FilePath:      cfg.Output.EnrichedPath,
+			FlushInterval: cfg.Output.FlushInterval,
+			BufferSize:    cfg.Output.BufferSize,
+		}
+		enrichedWriter, err = writers.NewEnrichedWriter(enrichedCfg)
+		if err != nil {
+			log.Error("Failed to create enriched writer: %v", err)
+			return
+		}
+		defer enrichedWriter.Close()
+		log.Info("Enriched output enabled: %s", cfg.Output.EnrichedPath)
+	}
+
+	// Создаем оркестратор с поддержкой всех трех режимов
 	orch := service.NewOrchestrator(
 		source,
 		repo,
-		writer,
+		writer,         // может быть nil
+		nerWriter,      // может быть nil
+		enrichedWriter, // может быть nil
 		debugWriter,
 		cfg.Manticore.Workers,
 		cfg.Manticore.BatchSize,
@@ -141,6 +174,12 @@ func main() {
 		log.Error("Processing failed: %v", err)
 	}
 
-	// Финальный сброс debugWriter
+	// Финальный сброс всех writer'ов
 	debugWriter.Flush()
+	if nerWriter != nil {
+		nerWriter.Flush()
+	}
+	if enrichedWriter != nil {
+		enrichedWriter.Flush()
+	}
 }

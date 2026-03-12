@@ -34,7 +34,9 @@ type Config struct {
 	}
 
 	Output struct {
-		Path          string
+		Path          string // режим 1: только геохеши (results.ndjson)
+		NerPath       string // режим 2: только NER (ner.ndjson)
+		EnrichedPath  string // режим 3: полный (enriched.ndjson)
 		FlushInterval time.Duration
 		BufferSize    int
 		UseGzip       bool
@@ -61,8 +63,8 @@ func Load() *Config {
 	// CSV flags
 	flag.StringVar(&cfg.CSV.Path, "csv", "data.csv", "path to CSV file")
 	flag.StringVar(&cfg.CSV.Delimiter, "delim", "|", "CSV delimiter")
+	flag.IntVar(&cfg.CSV.BatchSize, "csv-batch", 500, "Maximum records per batch")
 	flag.IntVar(&cfg.CSV.MinBatchSize, "csv-min-batch", 100, "Minimum records to trigger batch send")
-	flag.IntVar(&cfg.CSV.BatchSize, "csv-batch", 10000, "CSV read batch size")
 	flag.StringVar(&cfg.CSV.CheckpointPath, "checkpoint", "geostreamer.checkpoint", "path to checkpoint file")
 	flag.BoolVar(&cfg.CSV.StrictMode, "strict", false, "strict mode - stop on any error")
 	flag.BoolVar(&cfg.CSV.DebugMode, "debug", false, "debug mode - show detailed info")
@@ -78,26 +80,26 @@ func Load() *Config {
 	flag.IntVar(&cfg.Manticore.BatchSize, "manticore-batch", 500, "Manticore batch query size")
 	flag.IntVar(&cfg.Manticore.Workers, "manticore-workers", 20, "Number of parallel Manticore workers")
 	flag.BoolVar(&cfg.Manticore.DebugMode, "manticore-debug", false, "Manticore client debug mode")
-	flag.IntVar(&cfg.Manticore.ParallelQueries, "manticore-parallel", 20, "Number of parallel queries per batch")
+	flag.IntVar(&cfg.Manticore.ParallelQueries, "manticore-parallel", 5, "Number of parallel queries per batch")
 
 	// Output flags
-	flag.StringVar(&cfg.Output.Path, "output", "results.ndjson", "Path to output NDJSON file")
+	flag.StringVar(&cfg.Output.Path, "output", "results.ndjson", "Path to output NDJSON file (geohashes only)")
+	flag.StringVar(&cfg.Output.NerPath, "output-ner", "", "Path to NER-only NDJSON file (doc_id + ner info)")
+	flag.StringVar(&cfg.Output.EnrichedPath, "output-enriched", "", "Path to enriched NDJSON file (geohashes + ner info)")
 	flag.DurationVar(&cfg.Output.FlushInterval, "output-flush", 5*time.Second, "Output file flush interval")
 	flag.IntVar(&cfg.Output.BufferSize, "output-buffer", 1024*1024, "Output buffer size in bytes")
 	flag.BoolVar(&cfg.Output.UseGzip, "output-gzip", false, "Compress output file with gzip")
 	flag.BoolVar(&cfg.Output.PrettyPrint, "output-pretty", false, "Pretty print JSON (slower, larger files)")
+	flag.StringVar(&cfg.Output.FailuresPath, "output-failures", "failures.ndjson", "Path to save failed queries")
+	flag.StringVar(&cfg.Output.SkippedPath, "output-skipped", "skipped.ndjson", "Path to save skipped records")
+
+	// Filter flags
+	entityTypes := flag.String("filter-types", "LOC", "Comma-separated entity types to process (e.g., 'LOC,PER,ORG')")
 
 	// Logging flags
 	flag.StringVar(&cfg.Logging.Level, "log-level", "info", "Log level (debug, info, warn, error)")
 	flag.StringVar(&cfg.Logging.OutputFile, "log-file", "", "Log file path (empty for stdout)")
 	flag.DurationVar(&cfg.Logging.StatsInterval, "log-stats", 10*time.Second, "Statistics output interval")
-
-	// Filter flags
-	entityTypes := flag.String("filter-types", "LOC", "Comma-separated entity types to process (e.g., 'LOC,PER,ORG')")
-
-	// Output flags for debugging
-	flag.StringVar(&cfg.Output.FailuresPath, "output-failures", "failures.ndjson", "Path to save failed queries")
-	flag.StringVar(&cfg.Output.SkippedPath, "output-skipped", "skipped.ndjson", "Path to save skipped records")
 
 	flag.Parse()
 
