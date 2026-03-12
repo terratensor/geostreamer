@@ -46,8 +46,8 @@ doc_id|entity_type|entity_text|confidence|start_pos|end_pos
 Для просмотра версии:
 ```bash
 ./geostreamer -version
-# GeoStreamer 1.0.0 (commit: abc123, built: 2024-03-09_23:55:55)
-
+# GeoStreamer v1.0.0-1-gd716e88-dirty (commit: d716e88, built: 2026-03-12_08:20:53)
+```
 ## Параметры запуска
 
 ### Параметры CSV
