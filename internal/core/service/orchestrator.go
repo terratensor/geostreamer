@@ -20,8 +20,9 @@ import (
 type Orchestrator struct {
 	source         input.RecordSource
 	repo           repository.GeonameRepository
-	writer         output.ResultWriter
-	enrichedWriter *writers.EnrichedWriter // опциональный enriched writer
+	writer         output.ResultWriter     // режим 1: только геохеши
+	nerWriter      *writers.NerWriter      // режим 2: только NER
+	enrichedWriter *writers.EnrichedWriter // режим 3: полный
 	debugWriter    *writers.DebugWriter
 	workers        int
 	batchSize      int // количество строк в батче
@@ -41,7 +42,8 @@ type Orchestrator struct {
 func NewOrchestrator(
 	source input.RecordSource,
 	repo repository.GeonameRepository,
-	writer output.ResultWriter,
+	writer output.ResultWriter, // может быть nil
+	nerWriter *writers.NerWriter, // может быть nil
 	enrichedWriter *writers.EnrichedWriter, // может быть nil
 	debugWriter *writers.DebugWriter,
 	workers, batchSize, flushCount int,
@@ -58,8 +60,9 @@ func NewOrchestrator(
 		source:         source,
 		repo:           repo,
 		writer:         writer,
-		debugWriter:    debugWriter,
+		nerWriter:      nerWriter,
 		enrichedWriter: enrichedWriter,
+		debugWriter:    debugWriter,
 		workers:        workers,
 		batchSize:      batchSize,
 		flushCount:     flushCount,
@@ -318,9 +321,6 @@ func (o *Orchestrator) processDocRecords(ctx context.Context, workerID int,
 				o.writeSkippedFromInfo(rec, nil, "query_error")
 			}
 			// Не возвращаемся, продолжаем обработку non-LocRecords
-
-			// Важно: обнуляем hitsMap и infoMap при ошибке,
-			// чтобы дальше не пытаться их использовать
 			hitsMap = nil
 			infoMap = nil
 		}
@@ -411,20 +411,43 @@ func (o *Orchestrator) processDocRecords(ctx context.Context, workerID int,
 		}
 	}
 
-	// 5. Формируем GeoOutput для обычного результата (только если есть геохеши)
+	// Логируем информацию о наличии геохешей в документе (только в debug режиме)
 	if hasGeohashes {
-		if len(result.GeohashesStringMap) > 0 || len(result.GeohashesUint64Map) > 0 {
-			resultsChan <- result
-		}
+		o.log.Debug("Document %s has %d geohashes", docID, len(result.GeohashesStringMap))
 	}
 
-	// 6. ВСЕГДА формируем и отправляем enriched результат (если включен)
+	// 5. Формируем GeoOutput для режима 1 (только геохеши)
+	geoOutput := result.ToOutput()
+
+	// Режим 1: всегда пишем в обычный writer (если есть и есть геохеши)
+	if o.writer != nil && (len(geoOutput.GeohashesString) > 0 || len(geoOutput.GeohashesUint64) > 0) {
+		resultsChan <- result
+	}
+
+	// 6. Режим 2: NER-only (если включен)
+	if o.nerWriter != nil && (len(enrichedNerLOC) > 0 || len(enrichedNerPER) > 0 || len(enrichedNerORG) > 0) {
+		nerOutput := &domain.NerOutput{
+			DocID:  docID,
+			NerLOC: enrichedNerLOC,
+			NerPER: enrichedNerPER,
+			NerORG: enrichedNerORG,
+		}
+
+		// Отправляем NER-only результат (в отдельной горутине чтобы не блокировать)
+		go func() {
+			batch := []domain.NerOutput{*nerOutput}
+			if err := o.nerWriter.WriteBatch(ctx, batch); err != nil {
+				o.log.Error("Failed to write NER result for doc_id %s: %v", docID, err)
+			}
+		}()
+	}
+
+	// 7. Режим 3: полный (если включен)
 	if o.enrichedWriter != nil {
-		geoOutput := result.ToOutput() // может быть с пустыми массивами
 		enrichedResult := &domain.EnrichedGeoOutput{
 			DocID:           docID,
-			GeohashesString: geoOutput.GeohashesString, // может быть пустым
-			GeohashesUint64: geoOutput.GeohashesUint64, // может быть пустым
+			GeohashesString: geoOutput.GeohashesString,
+			GeohashesUint64: geoOutput.GeohashesUint64,
 			NerLOC:          enrichedNerLOC,
 			NerPER:          enrichedNerPER,
 			NerORG:          enrichedNerORG,
