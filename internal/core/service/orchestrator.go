@@ -251,170 +251,192 @@ func (o *Orchestrator) processBatch(ctx context.Context, workerID int,
 func (o *Orchestrator) processDocRecords(ctx context.Context, workerID int,
 	docID string, records []domain.CSVRecord, resultsChan chan<- *domain.GeoResult) {
 
-	// 1. Фильтруем записи по типу (только LOC)
+	// 1. Фильтруем записи по выбранным типам из entityTypes
 	var filteredRecords []domain.CSVRecord
 	for _, rec := range records {
 		if len(o.entityTypes) > 0 && o.entityTypes[rec.EntityType] {
 			filteredRecords = append(filteredRecords, rec)
 		} else {
-			// Не LOC - увеличиваем filtered
+			// Не выбранный тип - увеличиваем filtered
 			o.mu.Lock()
 			o.filtered++
 			o.mu.Unlock()
 		}
 	}
 
+	// Если нет записей выбранных типов, ничего не делаем
 	if len(filteredRecords) == 0 {
-		return // все записи этого doc_id отфильтрованы
+		return
 	}
 
-	// 2. Собираем уникальные тексты для запроса к Manticore
-	uniqueTexts := make([]string, 0)
-	textMap := make(map[string]bool)
+	// 2. Разделяем записи на LOC и не-LOC
+	var locRecords []domain.CSVRecord
+	var nonLocRecords []domain.CSVRecord // PER и ORG
+
 	for _, rec := range filteredRecords {
-		if !textMap[rec.EntityText] {
-			textMap[rec.EntityText] = true
-			uniqueTexts = append(uniqueTexts, rec.EntityText)
+		if rec.EntityType == "LOC" {
+			locRecords = append(locRecords, rec)
+		} else {
+			nonLocRecords = append(nonLocRecords, rec)
 		}
 	}
 
-	// 3. Выполняем запрос к Manticore
+	// 3. Для LOC записей собираем уникальные тексты и делаем запрос к Manticore
 	var hitsMap map[string][]domain.GeoHit
 	var infoMap map[string]*repositories.QueryInfo
 	var err error
 
-	if repoDebug, ok := o.repo.(interface {
-		FindBatchWithInfo(ctx context.Context, entityTexts []string, workerID int) (map[string][]domain.GeoHit, map[string]*repositories.QueryInfo, error)
-	}); ok {
-		hitsMap, infoMap, err = repoDebug.FindBatchWithInfo(ctx, uniqueTexts, workerID)
-	} else {
-		// Fallback
-		hitsMap, err = o.repo.FindBatch(ctx, uniqueTexts)
-	}
-
-	if err != nil {
-		// Ошибка запроса - все записи этого doc_id идут в skipped
-		o.mu.Lock()
-		o.skipped += int64(len(filteredRecords))
-		o.mu.Unlock()
-
-		// Записываем в skipped файл для каждой записи
-		for _, rec := range filteredRecords {
-			o.writeSkippedFromInfo(rec, nil, "query_error")
+	if len(locRecords) > 0 {
+		// Собираем уникальные тексты LOC для запроса
+		uniqueLOCtexts := make([]string, 0)
+		textMap := make(map[string]bool)
+		for _, rec := range locRecords {
+			if !textMap[rec.EntityText] {
+				textMap[rec.EntityText] = true
+				uniqueLOCtexts = append(uniqueLOCtexts, rec.EntityText)
+			}
 		}
-		return
-	}
 
-	// 4. Разделяем записи на те, что с hits, и те, что без
-	var recordsWithHits []domain.CSVRecord
-	var recordsWithoutHits []domain.CSVRecord
-
-	for _, rec := range filteredRecords {
-		hits := hitsMap[rec.EntityText]
-		if len(hits) == 0 {
-			recordsWithoutHits = append(recordsWithoutHits, rec)
-			o.writeSkippedFromInfo(rec, infoMap[rec.EntityText], "not_found_in_manticore")
+		// Выполняем запрос к Manticore только для LOC
+		if repoDebug, ok := o.repo.(interface {
+			FindBatchWithInfo(ctx context.Context, entityTexts []string, workerID int) (map[string][]domain.GeoHit, map[string]*repositories.QueryInfo, error)
+		}); ok {
+			hitsMap, infoMap, err = repoDebug.FindBatchWithInfo(ctx, uniqueLOCtexts, workerID)
 		} else {
-			recordsWithHits = append(recordsWithHits, rec)
+			// Fallback
+			hitsMap, err = o.repo.FindBatch(ctx, uniqueLOCtexts)
+		}
+
+		if err != nil {
+			// Ошибка запроса - все LOC записи этого doc_id идут в skipped
+			o.mu.Lock()
+			o.skipped += int64(len(locRecords))
+			o.mu.Unlock()
+
+			// Записываем в skipped файл для каждой LOC записи
+			for _, rec := range locRecords {
+				o.writeSkippedFromInfo(rec, nil, "query_error")
+			}
+			// Не возвращаемся, продолжаем обработку non-LocRecords
+
+			// Важно: обнуляем hitsMap и infoMap при ошибке,
+			// чтобы дальше не пытаться их использовать
+			hitsMap = nil
+			infoMap = nil
 		}
 	}
 
-	// 5. Проверяем, есть ли геохеши среди записей с hits
-	hasGeohashes := false
-	result := domain.NewGeoResult(docID)
-
-	// Для enriched сбора
+	// 4. Собираем NER-информацию для ВСЕХ записей
 	var enrichedNerLOC []domain.NEREntity
 	var enrichedNerPER []domain.NEREntity
 	var enrichedNerORG []domain.NEREntity
 
-	// Для записей с hits проверяем наличие геохешей
-	for _, rec := range recordsWithHits {
-		hits := hitsMap[rec.EntityText]
-		var recordGeohashes []string
-		recordHasGeo := false
+	// Результат для геохешей (только от LOC с hits)
+	result := domain.NewGeoResult(docID)
+	hasGeohashes := false
 
-		for _, hit := range hits {
-			strs, uints := hit.ToGeoResult()
-			if len(strs) > 0 || len(uints) > 0 {
-				recordHasGeo = true
-				hasGeohashes = true
-				recordGeohashes = append(recordGeohashes, strs...)
+	// Проходим по ВСЕМ записям (locRecords + nonLocRecords)
+	allRecords := append(locRecords, nonLocRecords...)
 
-				// Добавляем все геохеши в основной результат
-				for _, s := range strs {
-					result.GeohashesStringMap[s] = struct{}{}
+	for _, rec := range allRecords {
+		// Для всех типов создаем NER-запись
+		nerEntity := domain.NEREntity{
+			Value:      rec.EntityText,
+			StartPos:   rec.StartPos,
+			EndPos:     rec.EndPos,
+			Geohash:    []string{}, // по умолчанию пустой массив
+			Confidence: rec.Confidence,
+		}
+
+		// Для LOC пытаемся найти геохеши
+		if rec.EntityType == "LOC" {
+			var recordGeohashes []string
+			uniqueGeoMap := make(map[string]bool)
+			recordHasGeo := false
+
+			if hitsMap != nil {
+				hits := hitsMap[rec.EntityText]
+				info := infoMap[rec.EntityText]
+
+				if len(hits) > 0 {
+					for _, hit := range hits {
+						strs, uints := hit.ToGeoResult()
+						if len(strs) > 0 || len(uints) > 0 {
+							recordHasGeo = true
+							hasGeohashes = true
+
+							// Добавляем уникальные строковые геохеши
+							for _, s := range strs {
+								if !uniqueGeoMap[s] {
+									uniqueGeoMap[s] = true
+									recordGeohashes = append(recordGeohashes, s)
+								}
+								// Добавляем в общий результат для doc_id
+								result.GeohashesStringMap[s] = struct{}{}
+							}
+
+							// Добавляем уникальные uint64 геохеши в основной результат
+							for _, u := range uints {
+								result.GeohashesUint64Map[u] = struct{}{}
+							}
+						}
+					}
+					nerEntity.Geohash = recordGeohashes
+				} else {
+					// Нет hits - записываем в skipped для LOC
+					o.writeSkippedFromInfo(rec, info, "not_found_in_manticore")
 				}
-				for _, u := range uints {
-					result.GeohashesUint64Map[u] = struct{}{}
-				}
+			}
+
+			// Обновляем статистику для LOC
+			if recordHasGeo {
+				o.mu.Lock()
+				o.processed++
+				o.mu.Unlock()
+			} else {
+				o.mu.Lock()
+				o.skipped++
+				o.mu.Unlock()
 			}
 		}
 
-		// Если есть enriched writer и запись имеет геохеши, собираем NER-информацию
-		if o.enrichedWriter != nil && recordHasGeo {
-			nerEntity := domain.NEREntity{
-				Value:      rec.EntityText,
-				StartPos:   rec.StartPos,
-				EndPos:     rec.EndPos,
-				Geohash:    recordGeohashes,
-				Confidence: rec.Confidence,
-			}
-
-			switch rec.EntityType {
-			case "LOC":
-				enrichedNerLOC = append(enrichedNerLOC, nerEntity)
-			case "PER":
-				enrichedNerPER = append(enrichedNerPER, nerEntity)
-			case "ORG":
-				enrichedNerORG = append(enrichedNerORG, nerEntity)
-			}
+		// Добавляем в соответствующий NER-массив по типу
+		switch rec.EntityType {
+		case "LOC":
+			enrichedNerLOC = append(enrichedNerLOC, nerEntity)
+		case "PER":
+			enrichedNerPER = append(enrichedNerPER, nerEntity)
+		case "ORG":
+			enrichedNerORG = append(enrichedNerORG, nerEntity)
 		}
 	}
 
-	// 6. Обновляем статистику в зависимости от наличия геохешей
-	o.mu.Lock()
+	// 5. Формируем GeoOutput для обычного результата (только если есть геохеши)
 	if hasGeohashes {
-		// Есть геохеши - записи с hits идут в processed, без hits - в skipped
-		o.processed += int64(len(recordsWithHits))
-		o.skipped += int64(len(recordsWithoutHits))
-		o.mu.Unlock()
-
-		// Отправляем обычный результат
 		if len(result.GeohashesStringMap) > 0 || len(result.GeohashesUint64Map) > 0 {
 			resultsChan <- result
 		}
+	}
 
-		// Если есть enriched writer, формируем и отправляем enriched результат
-		if o.enrichedWriter != nil && (len(enrichedNerLOC) > 0 || len(enrichedNerPER) > 0 || len(enrichedNerORG) > 0) {
-			geoOutput := result.ToOutput()
-			enrichedResult := &domain.EnrichedGeoOutput{
-				DocID:           geoOutput.DocID,
-				GeohashesString: geoOutput.GeohashesString,
-				GeohashesUint64: geoOutput.GeohashesUint64,
-				NerLOC:          enrichedNerLOC,
-				NerPER:          enrichedNerPER,
-				NerORG:          enrichedNerORG,
+	// 6. ВСЕГДА формируем и отправляем enriched результат (если включен)
+	if o.enrichedWriter != nil {
+		geoOutput := result.ToOutput() // может быть с пустыми массивами
+		enrichedResult := &domain.EnrichedGeoOutput{
+			DocID:           docID,
+			GeohashesString: geoOutput.GeohashesString, // может быть пустым
+			GeohashesUint64: geoOutput.GeohashesUint64, // может быть пустым
+			NerLOC:          enrichedNerLOC,
+			NerPER:          enrichedNerPER,
+			NerORG:          enrichedNerORG,
+		}
+
+		// Отправляем enriched результат (в отдельной горутине чтобы не блокировать)
+		go func() {
+			batch := []domain.EnrichedGeoOutput{*enrichedResult}
+			if err := o.enrichedWriter.WriteBatch(ctx, batch); err != nil {
+				o.log.Error("Failed to write enriched result for doc_id %s: %v", docID, err)
 			}
-
-			// Отправляем enriched результат (в отдельной горутине чтобы не блокировать)
-			go func() {
-				batch := []domain.EnrichedGeoOutput{*enrichedResult}
-				if err := o.enrichedWriter.WriteBatch(ctx, batch); err != nil {
-					o.log.Error("Failed to write enriched result for doc_id %s: %v", docID, err)
-				}
-			}()
-		}
-	} else {
-		// Нет геохешей - все записи идут в skipped
-		o.skipped += int64(len(recordsWithHits) + len(recordsWithoutHits))
-		o.mu.Unlock()
-
-		// Записи с hits (но без геохешей) тоже нужно записать в skipped файл
-		for _, rec := range recordsWithHits {
-			o.writeSkippedFromInfo(rec, infoMap[rec.EntityText], "hit_without_geohashes")
-		}
-		// Записи без hits уже записаны выше
+		}()
 	}
 }
 
